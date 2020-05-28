@@ -9,6 +9,7 @@ import kotlinx.atomicfu.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.internal.*
 import kotlinx.coroutines.internal.SegmentQueueSynchronizer.Mode.*
+import org.jetbrains.kotlinx.lincheck.*
 import org.jetbrains.kotlinx.lincheck.annotations.Operation
 import org.jetbrains.kotlinx.lincheck.verifier.*
 import org.junit.*
@@ -152,39 +153,43 @@ class SimpleCountDownLatch2LCStressTest : AbstractSimpleCountDownLatchLCStressTe
 
 
 internal class SimpleConflatedChannel<T : Any> : SegmentQueueSynchronizer<T>(SYNC) {
+    private val sends = atomic(0L)
+    private val receives = atomic(0L)
     private val state = atomic<Any?>(null) // null | element | WAITERS
-    private val waiters = atomic(0)
 
     fun send(x: T) {
         retry@while (true) {
-            val e = state.value
-            when {
-                e === null -> {
-                    // check whether the marker should be set
-                    // since it can be incorrectly re-set by this
-                    // or another `send`
-                    if (setMarkerIfNeeded()) continue@retry
-                    // try to set the element
-                    if (state.compareAndSet(null, x)) return
-                }
-                e === WAITERS -> {
-                    // check whether there exist a waiter
-                    if (decWaiters()) {
-                        // try to resume the first waiter synchronously;
-                        // otherwise, an implementation is not linearizable
-                        if (tryResume(x)) return
-                    } else {
-                        // the marker should be re-set
-                        state.compareAndSet(WAITERS, null)
-                        continue@retry
+            snapshotCounters { s, r ->
+                when {
+                    r > s -> { // is anybody waiting?
+                        if (sends.compareAndSet(s, s + 1) && tryResume(x))
+                            return
                     }
-                }
-                else -> {
-                    // try to conflate the element
-                    if (state.compareAndSet(e, x)) return
+                    s == r -> { // is the channel empty?
+                        if (!state.compareAndSet(null, x)) return
+
+                        if (sends.compareAndSet(s, s + 1)) return
+                    }
+                    s == r + 1 -> { // can we conflate the element?
+                        if (tryConflate(x)) return
+                    }
                 }
             }
         }
+    }
+
+    private inline fun <R> snapshotCounters(action: (s: Long, r: Long) -> R): R {
+        while (true) {
+            val s = sends.value
+            val r = receives.value
+            if (s != sends.value) continue
+            return action(s, r)
+        }
+    }
+
+    private fun tryConflate(x: T): Boolean = state.loop { cur ->
+        if (cur === null) return false
+        if (state.compareAndSet(cur, x)) return true
     }
 
     fun tryReceive(): T? {
@@ -265,6 +270,10 @@ class SimpleConflatedChannelLCStressTest {
     @Test
     fun test() = LCStressOptionsDefault()
         .sequentialSpecification(SimpleConflatedChannelIntSpec::class.java)
+        .threads(4)
+        .actorsPerThread(3)
+        .invocationsPerIteration(100_000)
+        .logLevel(LoggingLevel.INFO)
         .check(this::class)
 }
 
@@ -337,4 +346,8 @@ class SimpleBarrierLCStressTest : VerifierState() {
         .actorsAfter(0)
         .threads(3)
         .check(this::class)
+}
+
+class MyCancellableContinuation<T> : CancellableContinuation<T> {
+
 }
