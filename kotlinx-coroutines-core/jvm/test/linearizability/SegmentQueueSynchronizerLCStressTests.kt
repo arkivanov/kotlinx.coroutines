@@ -13,6 +13,7 @@ import org.jetbrains.kotlinx.lincheck.annotations.Operation
 import org.jetbrains.kotlinx.lincheck.verifier.*
 import org.junit.*
 import kotlin.coroutines.*
+import kotlin.reflect.*
 
 /*
   This test suite is not only but tests, but also provides a set of example
@@ -127,7 +128,30 @@ internal class SimpleCountDownLatch(count: Int) : SegmentQueueSynchronizer<Unit>
 }
 private const val DONE_MARK = 1 shl 31
 
-abstract class SimpleCountDownLatchLCStressTest(count: Int) : VerifierState() {
+open class SimpleCountDownLatchSequential(count: Int) : VerifierState() {
+    private var count = count
+    private val waiters = ArrayList<CancellableContinuation<Unit>>()
+
+    fun countDown() {
+        if (--count == 0) {
+            waiters.forEach { it.tryResume0(Unit) }
+            waiters.clear()
+        }
+    }
+
+    suspend fun await() {
+        if (count <= 0) return
+        suspendAtomicCancellableCoroutine<Unit> { cont ->
+            waiters.add(cont)
+        }
+    }
+
+    fun remaining(): Int = count.coerceAtLeast(0)
+
+    override fun extractState() = remaining()
+}
+
+abstract class SimpleCountDownLatchLCStressTest(count: Int, val seqSpec: KClass<*>) {
     private val cdl = SimpleCountDownLatch(count)
 
     @Operation
@@ -139,22 +163,23 @@ abstract class SimpleCountDownLatchLCStressTest(count: Int) : VerifierState() {
     @Operation
     suspend fun await() = cdl.await()
 
-    override fun extractState() = remaining()
-
     @Test
     fun test() = LCStressOptionsDefault()
         .actorsBefore(0)
         .actorsAfter(0)
+        .sequentialSpecification(seqSpec.java)
         .check(this::class)
 }
-class SimpleCountDownLatch1LCStressTest : SimpleCountDownLatchLCStressTest(1)
-class SimpleCountDownLatch2LCStressTest : SimpleCountDownLatchLCStressTest(2)
+
+class SimpleCountDownLatchSequential1 : SimpleCountDownLatchSequential(1)
+class SimpleCountDownLatch1LCStressTest : SimpleCountDownLatchLCStressTest(1, SimpleCountDownLatchSequential1::class)
+
+class SimpleCountDownLatchSequential2 : SimpleCountDownLatchSequential(2)
+class SimpleCountDownLatch2LCStressTest : SimpleCountDownLatchLCStressTest(2, SimpleCountDownLatchSequential2::class)
 
 
 internal class SimpleBarrier(private val parties: Int) : SegmentQueueSynchronizer<Boolean>(ASYNC) {
     private val arrived = atomic(0L)
-
-    val done get() = arrived.value >= parties
 
     suspend fun arrive(): Boolean {
         val a = arrived.incrementAndGet()
@@ -173,21 +198,50 @@ internal class SimpleBarrier(private val parties: Int) : SegmentQueueSynchronize
     }
 }
 
-class SimpleBarrierLCStressTest : VerifierState() {
-    private val b = SimpleBarrier(3)
+open class SimpleBarrierSequential(parties: Int) : VerifierState() {
+    private var remainig = parties
+    private val waiters = ArrayList<Continuation<Unit>>()
+
+    suspend fun arrive(): Boolean {
+        val r = --remainig
+        return when {
+            r > 0 -> {
+                suspendCoroutine<Unit> { cont ->
+                    waiters.add(cont)
+                }
+                true
+            }
+            r == 0 -> {
+                waiters.forEach { it.resume(Unit) }
+                true
+            }
+            else -> false
+        }
+    }
+
+    override fun extractState() = remainig > 0
+}
+
+abstract class SimpleBarrierLCStressTest(parties: Int, val seqSpec: KClass<*>) {
+    private val b = SimpleBarrier(parties)
 
     @Operation(cancellableOnSuspension = false)
     suspend fun arrive() = b.arrive()
-
-    override fun extractState() = b.done
 
     @Test
     fun test() = LCStressOptionsDefault()
         .actorsBefore(0)
         .actorsAfter(0)
         .threads(3)
+        .sequentialSpecification(seqSpec.java)
         .check(this::class)
 }
+
+class SimpleBarrierSequential1 : SimpleBarrierSequential(1)
+class SimpleBarrier1LCStressTest : SimpleBarrierLCStressTest(1, SimpleBarrierSequential1::class)
+class SimpleBarrierSequential2 : SimpleBarrierSequential(2)
+class SimpleBarrier2LCStressTest : SimpleBarrierLCStressTest(2, SimpleBarrierSequential2::class)
+
 
 internal class SimpleBlockingQueue<T: Any> : SegmentQueueSynchronizer<T>(SYNC) {
     private val balance = atomic(0L) // #add  - #poll
