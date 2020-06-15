@@ -9,7 +9,6 @@ import kotlinx.atomicfu.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.internal.*
 import kotlinx.coroutines.internal.SegmentQueueSynchronizer.Mode.*
-import org.jetbrains.kotlinx.lincheck.*
 import org.jetbrains.kotlinx.lincheck.annotations.Operation
 import org.jetbrains.kotlinx.lincheck.verifier.*
 import org.junit.*
@@ -121,14 +120,14 @@ internal class SimpleCountDownLatch(count: Int) : SegmentQueueSynchronizer<Unit>
         // add a new waiter (checking the counter again)
         val w = waiters.incrementAndGet()
         if (w and DONE_MARK != 0) return
-        suspendCancellableCoroutine<Unit> { suspend(it) }
+        suspendAtomicCancellableCoroutineReusable<Unit> { suspend(it) }
     }
 
     fun remaining(): Int = count.value.coerceAtLeast(0)
 }
 private const val DONE_MARK = 1 shl 31
 
-abstract class AbstractSimpleCountDownLatchLCStressTest(count: Int) : VerifierState() {
+abstract class SimpleCountDownLatchLCStressTest(count: Int) : VerifierState() {
     private val cdl = SimpleCountDownLatch(count)
 
     @Operation
@@ -148,166 +147,8 @@ abstract class AbstractSimpleCountDownLatchLCStressTest(count: Int) : VerifierSt
         .actorsAfter(0)
         .check(this::class)
 }
-class SimpleCountDownLatch1LCStressTest : AbstractSimpleCountDownLatchLCStressTest(1)
-class SimpleCountDownLatch2LCStressTest : AbstractSimpleCountDownLatchLCStressTest(2)
-
-
-internal class SimpleConflatedChannel<T : Any> : SegmentQueueSynchronizer<T>(SYNC) {
-    private val sends = atomic(0L)
-    private val receives = atomic(0L)
-    private val state = atomic<Any?>(null) // null | element | WAITERS
-
-    fun send(x: T) {
-        retry@while (true) {
-            snapshotCounters { s, r ->
-                when {
-                    r > s -> { // is anybody waiting?
-                        if (sends.compareAndSet(s, s + 1) && tryResume(x))
-                            return
-                    }
-                    s == r -> { // is the channel empty?
-                        if (!state.compareAndSet(null, x)) return
-
-                        if (sends.compareAndSet(s, s + 1)) return
-                    }
-                    s == r + 1 -> { // can we conflate the element?
-                        if (tryConflate(x)) return
-                    }
-                }
-            }
-        }
-    }
-
-    private inline fun <R> snapshotCounters(action: (s: Long, r: Long) -> R): R {
-        while (true) {
-            val s = sends.value
-            val r = receives.value
-            if (s != sends.value) continue
-            return action(s, r)
-        }
-    }
-
-    private fun tryConflate(x: T): Boolean = state.loop { cur ->
-        if (cur === null) return false
-        if (state.compareAndSet(cur, x)) return true
-    }
-
-    fun tryReceive(): T? {
-        state.loop { s ->
-            if (s === null || s === WAITERS) return null
-            // an element is stored
-            if (state.compareAndSet(s, null)) return s as T
-        }
-    }
-
-    suspend fun receive(): T {
-        while (true) {
-            // Try to retrieve an element
-            val e = tryReceive()
-            if (e !== null) return e
-            // Try to increment the number of waiters, set the marker
-            // to the `state`, and suspend.
-            waiters.incrementAndGet()
-            val suspend = setMarker() || !decWaiters()
-            if (suspend) return receiveSlowPath()
-        }
-    }
-
-    private suspend fun receiveSlowPath()  = suspendAtomicCancellableCoroutineReusable<T> sc@ { cont ->
-        if (suspend(cont)) return@sc
-        while (true) {
-            // Try to retrieve an element
-            val e = tryReceive()
-            if (e !== null) {
-                cont.resume(e)
-                return@sc
-            }
-            // Try to increment the number of waiters, set the marker
-            // to the `state`, and suspend.
-            waiters.incrementAndGet()
-            val suspend = setMarker() || !decWaiters()
-            if (suspend && suspend(cont)) return@sc
-        }
-    }
-
-    private fun setMarkerIfNeeded(): Boolean {
-        if (waiters.value == 0) return false
-        state.compareAndSet(null, WAITERS)
-        return true
-    }
-
-    private fun decWaiters() : Boolean {
-        waiters.loop { w ->
-            if (w == 0) return false
-            if (waiters.compareAndSet(w, w - 1)) return true
-        }
-    }
-
-    private fun setMarker(): Boolean {
-        state.loop { s ->
-            if (s === WAITERS) return true
-            if (s === null) {
-                if (state.compareAndSet(null, WAITERS)) return true
-            }
-            return false // an element is stored
-        }
-    }
-}
-private val WAITERS = Symbol("WAITERS")
-
-class SimpleConflatedChannelLCStressTest {
-    private val c = SimpleConflatedChannel<Int>()
-
-    @Operation
-    fun send(e: Int) = c.send(e)
-
-    @Operation(cancellableOnSuspension = true)
-    suspend fun receive() = c.receive()
-
-    @Operation
-    fun tryReceive() = c.tryReceive()
-
-    @Test
-    fun test() = LCStressOptionsDefault()
-        .sequentialSpecification(SimpleConflatedChannelIntSpec::class.java)
-        .threads(4)
-        .actorsPerThread(3)
-        .invocationsPerIteration(100_000)
-        .logLevel(LoggingLevel.INFO)
-        .check(this::class)
-}
-
-class SimpleConflatedChannelIntSpec : VerifierState() {
-    private val waiters = ArrayList<CancellableContinuation<Int>>()
-    private var element = Int.MAX_VALUE
-
-    fun send(e: Int) {
-        while (true) {
-            if (waiters.isEmpty()) {
-                element = e
-                return
-            } else {
-                val w = waiters.removeAt(0)
-                val token = w.tryResume(e) ?: continue
-                w.completeResume(token)
-                return
-            }
-        }
-    }
-
-    suspend fun receive(): Int {
-        return tryReceive() ?: suspendAtomicCancellableCoroutine { cont ->
-            waiters.add(cont)
-        }
-    }
-
-    fun tryReceive(): Int? {
-        return if (element == Int.MAX_VALUE) null
-               else element.also { element = Int.MAX_VALUE }
-    }
-
-    override fun extractState() = element
-}
+class SimpleCountDownLatch1LCStressTest : SimpleCountDownLatchLCStressTest(1)
+class SimpleCountDownLatch2LCStressTest : SimpleCountDownLatchLCStressTest(2)
 
 
 internal class SimpleBarrier(private val parties: Int) : SegmentQueueSynchronizer<Boolean>(ASYNC) {
@@ -323,7 +164,7 @@ internal class SimpleBarrier(private val parties: Int) : SegmentQueueSynchronize
             }
             a == parties.toLong() -> {
                 repeat(parties - 1) {
-                    while (!tryResume(true)) {}
+                    tryResume(true)
                 }
                 true
             }
@@ -348,6 +189,203 @@ class SimpleBarrierLCStressTest : VerifierState() {
         .check(this::class)
 }
 
-class MyCancellableContinuation<T> : CancellableContinuation<T> {
+internal class SimpleBlockingQueue<T: Any> : SegmentQueueSynchronizer<T>(SYNC) {
+    private val balance = atomic(0L) // #add  - #poll
 
+    private val elements = atomicArrayOfNulls<Any?>(100) // This is an infinite array by design :)
+    private val adds = atomic(0)
+    private val polls = atomic(0)
+
+    fun add(x: T) {
+        while (true) {
+            val b = balance.getAndIncrement()
+            if (b < 0) {
+                if (tryResume(x)) return
+            } else {
+                if (tryInsert(x)) return
+            }
+        }
+    }
+
+    private fun tryInsert(x: T): Boolean {
+        val i = adds.getAndIncrement()
+        return elements[i].compareAndSet(null, x)
+    }
+
+    suspend fun poll(): T {
+        while (true) {
+            val b = balance.getAndDecrement()
+            if (b > 0) {
+                val x = tryRetrieve()
+                if (x != null) return x
+            } else {
+                val x = suspendAtomicCancellableCoroutineReusable<T?> { cont ->
+                    if (!suspend(cont)) cont.resume(null)
+                }
+                if (x != null) return x
+            }
+
+        }
+    }
+
+    private fun tryRetrieve(): T? {
+        val i = polls.getAndIncrement()
+        return elements[i].getAndSet(BROKEN) as T?
+    }
+
+    companion object {
+        @JvmStatic
+        val BROKEN = Symbol("BROKEN")
+    }
+}
+
+class SimpleBlockingQueueIntSequential : VerifierState() {
+    private val elements = ArrayList<Int>()
+    private val waiters = ArrayList<CancellableContinuation<Int>>()
+
+    fun add(x: Int) {
+        while (true) {
+            if (waiters.isNotEmpty()) {
+                val w = waiters.removeAt(0)
+                if (w.tryResume0(x)) return
+            } else {
+                elements.add(x)
+                return
+            }
+        }
+    }
+
+    suspend fun poll(): Int =
+        if (elements.isNotEmpty()) {
+            elements.removeAt(0)
+        } else {
+            suspendAtomicCancellableCoroutine { cont ->
+                waiters.add(cont)
+            }
+        }
+
+    override fun extractState() = elements
+}
+
+class SimpleBlockingQueueLCStressTest {
+    private val q = SimpleBlockingQueue<Int>()
+
+    @Operation
+    fun add(x: Int) = q.add(x)
+
+    @Operation
+    suspend fun poll(): Int = q.poll()
+
+    @Test
+    fun test() = LCStressOptionsDefault()
+        .sequentialSpecification(SimpleBlockingQueueIntSequential::class.java)
+        .check(this::class)
+}
+
+
+internal class SimpleBlockingStack<T: Any> : SegmentQueueSynchronizer<T>(SYNC) {
+    private val head = atomic<StackNode<T>?>(null)
+    private val balance = atomic(0) // #put - #pop
+
+    fun put(x: T) {
+        while (true) {
+            val b = balance.getAndIncrement()
+            if (b < 0) {
+                if (tryResume(x)) return
+            } else {
+                if (tryInsert(x)) return
+            }
+        }
+    }
+
+    private fun tryInsert(x: T): Boolean {
+        while (true) {
+            val h = head.value
+            if (h != null && h.element == null) {
+                if (head.compareAndSet(h, h.next)) return false
+            } else {
+                val newHead = StackNode(x, h)
+                if (head.compareAndSet(h, newHead)) return true
+            }
+        }
+    }
+
+    suspend fun pop(): T {
+        while (true) {
+            val b = balance.getAndDecrement()
+            if (b > 0) {
+                val x = tryRetrieve()
+                if (x != null) return x
+            } else {
+                val x = suspendAtomicCancellableCoroutineReusable<T?> { cont ->
+                    if (!suspend(cont)) cont.resume(null)
+                }
+                if (x != null) return x
+            }
+        }
+    }
+
+    private fun tryRetrieve(): T? {
+        while (true) {
+            val h = head.value
+            if (h == null || h.element == null) {
+                val suspendedNode = StackNode(null, h)
+                if (head.compareAndSet(h, suspendedNode)) return null
+            } else {
+                if (head.compareAndSet(h, h.next)) return h.element
+            }
+        }
+    }
+
+    class StackNode<T>(val element: T?, val next: StackNode<T>?)
+}
+
+internal class SimpleBlockingStackIntSequential : VerifierState() {
+    private val elements = ArrayList<Int>()
+    private val waiters = ArrayList<CancellableContinuation<Int>>()
+
+    fun put(x: Int) {
+        while (true) {
+            if (waiters.isNotEmpty()) {
+                val w = waiters.removeAt(0)
+                if (w.tryResume0(x)) return
+            } else {
+                elements.add(x)
+                return
+            }
+        }
+    }
+
+    suspend fun pop(): Int =
+        if (elements.isNotEmpty()) {
+            elements.removeAt(elements.size - 1)
+        } else {
+            suspendAtomicCancellableCoroutine { cont ->
+                waiters.add(cont)
+            }
+        }
+
+    override fun extractState() = elements
+}
+
+class SimpleBlockingStackLCStressTest {
+    private val s = SimpleBlockingStack<Int>()
+
+    @Operation
+    fun put(x: Int) = s.put(x)
+
+    @Operation(cancellableOnSuspension = false)
+    suspend fun pop(): Int = s.pop()
+
+    @Test
+    fun test() = LCStressOptionsDefault()
+        .sequentialSpecification(SimpleBlockingStackIntSequential::class.java)
+        .check(this::class)
+}
+
+
+private fun <T> CancellableContinuation<T>.tryResume0(value: T): Boolean {
+    val token = tryResume(value) ?: return false
+    completeResume(token)
+    return true
 }
