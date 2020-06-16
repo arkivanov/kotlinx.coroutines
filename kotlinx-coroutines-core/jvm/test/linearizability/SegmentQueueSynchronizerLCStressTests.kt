@@ -9,11 +9,17 @@ import kotlinx.atomicfu.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.internal.*
 import kotlinx.coroutines.internal.SegmentQueueSynchronizer.Mode.*
+import kotlinx.coroutines.sync.*
+import org.jetbrains.kotlinx.lincheck.*
 import org.jetbrains.kotlinx.lincheck.annotations.Operation
+import org.jetbrains.kotlinx.lincheck.execution.*
 import org.jetbrains.kotlinx.lincheck.verifier.*
 import org.junit.*
 import kotlin.coroutines.*
+import kotlin.coroutines.intrinsics.*
+import kotlin.random.*
 import kotlin.reflect.*
+import kotlin.reflect.jvm.*
 
 /*
   This test suite is not only but tests, but also provides a set of example
@@ -21,80 +27,66 @@ import kotlin.reflect.*
   synchronization primitives.
  */
 
-internal class SimpleMutex : SegmentQueueSynchronizer<Unit>(ASYNC) {
-    private val state = atomic(-1) // -1 -- locked, x>=0 -- number of waiters
+internal class SimpleSemaphoreAsync(val permits: Int) : SegmentQueueSynchronizer<Unit>(ASYNC), Semaphore {
+    private val _availablePermits = atomic(permits)
+    override val availablePermits = _availablePermits.value.coerceAtLeast(0)
 
-    fun isLocked() = state.value != -1
-
-    suspend fun lock() {
-        val s = state.getAndIncrement()
+    override suspend fun acquire() {
+        val p = _availablePermits.getAndDecrement()
         // Is the lock acquired?
-        if (s == -1) return
+        if (p > 0) return
         // Suspend otherwise
         suspendAtomicCancellableCoroutineReusable<Unit> { cont ->
             check(suspend(cont)) { "Should not fail in ASYNC mode" }
         }
     }
 
-    fun release() {
+    override fun tryAcquire() =  error("Not supported in the ASYNC version")
+
+    override fun release() {
         while (true) {
-            val s = state.getAndUpdate { cur ->
-                if (cur == -1) throw IllegalStateException("This mutex is unlocked")
-                cur - 1
-            }
-            if (s == 0) return // no waiters
-            if (tryResume(Unit)) return
+            val p = _availablePermits.getAndIncrement()
+            if (p >= 0) return // no waiters
+            if (tryResume(Unit)) return // can fail due to cancellation
         }
     }
 }
 
-class SimpleMutexLCSressTest : VerifierState() {
-    private val m = SimpleMutex()
+abstract class SemaphoreAsyncLCStressTestBase(semaphore: Semaphore, seqSpec: KClass<*>)
+    : SemaphoreLCStressTestBase(semaphore, seqSpec)
+{
+    override fun Options<*, *>.customize() = this.executionGenerator(CustomSemaphoreScenarioGenerator::class.java)
 
-    @Operation
-    suspend fun lock() = m.lock()
+    class CustomSemaphoreScenarioGenerator(testConfiguration: CTestConfiguration, testStructure: CTestStructure)
+        : ExecutionGenerator(testConfiguration, testStructure)
+    {
+        override fun nextExecution() = ExecutionScenario(
+            emptyList(),
+            generateParallelPart(testConfiguration.threads, testConfiguration.actorsPerThread),
+            emptyList()
+        )
 
-    @Operation(handleExceptionsAsResult = [IllegalStateException::class])
-    fun release() = m.release()
-
-    override fun extractState() = m.isLocked()
-
-    @Test
-    fun test() = LCStressOptionsDefault()
-        .actorsBefore(0)
-        .actorsAfter(0)
-        .check(this::class)
-
-}
-
-class SimpleMutexStressTest {
-    @Test
-    fun testSimple() = runBlocking {
-        val m = SimpleMutex()
-        check(!m.isLocked())
-        m.lock()
-        check(m.isLocked())
-        m.release()
-        check(!m.isLocked())
-    }
-
-    @Test
-    fun test() = runBlocking {
-        val t = 10
-        val n = 100_000
-        val m = SimpleMutex()
-        var c = 0
-        val jobs = (1..t).map { GlobalScope.launch {
-            repeat(n) {
-                m.lock()
-                c++
-                m.release()
+        private fun generateParallelPart(threads: Int, actorsPerThread: Int) = (1..threads).map {
+            val actors = ArrayList<Actor>()
+            var acquiredPermits = 0
+            repeat(actorsPerThread) {
+                actors += if (acquiredPermits == 0 || Random.nextBoolean()) {
+                    // acquire
+                    acquiredPermits++
+                    Actor(SemaphoreAsyncLCStressTestBase::acquire.javaMethod!!, emptyList(), emptyList(), Random.nextBoolean())
+                } else {
+                    // release
+                    acquiredPermits--
+                    Actor(SemaphoreAsyncLCStressTestBase::release.javaMethod!!, emptyList(), emptyList())
+                }
             }
-        } }
-        jobs.forEach { it.join() }
-        assert(c == n * t)
+            actors
+        }
     }
 }
+
+class SemaphoreAsync1LCStressTest : SemaphoreAsyncLCStressTestBase(SimpleSemaphoreAsync(1), SemaphoreSequential1::class)
+class SemaphoreAsync2LCStressTest : SemaphoreAsyncLCStressTestBase(SimpleSemaphoreAsync(2), SemaphoreSequential2::class)
 
 
 internal class SimpleCountDownLatch(count: Int) : SegmentQueueSynchronizer<Unit>(ASYNC) {
@@ -185,7 +177,7 @@ internal class SimpleBarrier(private val parties: Int) : SegmentQueueSynchronize
         val a = arrived.incrementAndGet()
         return when {
             a < parties -> {
-                suspendAtomicCancellableCoroutineReusable { cont -> suspend(cont) }
+                suspendMyAtomicCancellableCoroutine(this::onCancellation) { cont -> suspend(cont) }
             }
             a == parties.toLong() -> {
                 repeat(parties - 1) {
@@ -194,6 +186,17 @@ internal class SimpleBarrier(private val parties: Int) : SegmentQueueSynchronize
                 true
             }
             else -> false
+        }
+    }
+
+    private fun onCancellation(cont: CancellableContinuation<Boolean>) {
+        arrived.loop { cur ->
+            if (cur >= parties) {
+                cont.tryResume0(true)
+                return
+            } else {
+                if (arrived.compareAndSet(cur, cur - 1)) return
+            }
         }
     }
 }
@@ -206,8 +209,12 @@ open class SimpleBarrierSequential(parties: Int) : VerifierState() {
         val r = --remainig
         return when {
             r > 0 -> {
-                suspendCoroutine<Unit> { cont ->
+                suspendAtomicCancellableCoroutine<Unit> { cont ->
                     waiters.add(cont)
+                    cont.invokeOnCancellation {
+                        remainig++
+                        waiters.remove(cont)
+                    }
                 }
                 true
             }
@@ -225,7 +232,7 @@ open class SimpleBarrierSequential(parties: Int) : VerifierState() {
 abstract class SimpleBarrierLCStressTest(parties: Int, val seqSpec: KClass<*>) {
     private val b = SimpleBarrier(parties)
 
-    @Operation(cancellableOnSuspension = false)
+    @Operation
     suspend fun arrive() = b.arrive()
 
     @Test
@@ -241,6 +248,9 @@ class SimpleBarrierSequential1 : SimpleBarrierSequential(1)
 class SimpleBarrier1LCStressTest : SimpleBarrierLCStressTest(1, SimpleBarrierSequential1::class)
 class SimpleBarrierSequential2 : SimpleBarrierSequential(2)
 class SimpleBarrier2LCStressTest : SimpleBarrierLCStressTest(2, SimpleBarrierSequential2::class)
+
+
+
 
 
 internal class SimpleBlockingQueue<T: Any> : SegmentQueueSynchronizer<T>(SYNC) {
@@ -394,7 +404,7 @@ internal class SimpleBlockingStack<T: Any> : SegmentQueueSynchronizer<T>(SYNC) {
     class StackNode<T>(val element: T?, val next: StackNode<T>?)
 }
 
-internal class SimpleBlockingStackIntSequential : VerifierState() {
+class SimpleBlockingStackIntSequential : VerifierState() {
     private val elements = ArrayList<Int>()
     private val waiters = ArrayList<CancellableContinuation<Int>>()
 
@@ -428,7 +438,7 @@ class SimpleBlockingStackLCStressTest {
     @Operation
     fun put(x: Int) = s.put(x)
 
-    @Operation(cancellableOnSuspension = false)
+    @Operation()
     suspend fun pop(): Int = s.pop()
 
     @Test
@@ -443,3 +453,22 @@ private fun <T> CancellableContinuation<T>.tryResume0(value: T): Boolean {
     completeResume(token)
     return true
 }
+
+internal class MyCancellableContinuationImpl<T>(delegate: Continuation<T>, resumeMode: Int, val beforeCancelAction: (CancellableContinuation<T>) -> Unit)
+    : CancellableContinuationImpl<T>(delegate, resumeMode) {
+
+    override fun cancel(cause: Throwable?): Boolean {
+        beforeCancelAction(this)
+        return super.cancel(cause)
+    }
+}
+
+internal suspend inline fun <T> suspendMyAtomicCancellableCoroutine(
+    noinline beforeCancelAction: (CancellableContinuation<T>) -> Unit,
+    crossinline block: (CancellableContinuation<T>) -> Unit
+): T =
+    suspendCoroutineUninterceptedOrReturn { uCont ->
+        val cancellable = MyCancellableContinuationImpl(uCont.intercepted(), MODE_ATOMIC_DEFAULT, beforeCancelAction)
+        block(cancellable)
+        cancellable.getResult()
+    }
