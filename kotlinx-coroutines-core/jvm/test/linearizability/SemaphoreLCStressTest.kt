@@ -12,7 +12,7 @@ import org.jetbrains.kotlinx.lincheck.verifier.*
 import org.junit.*
 import kotlin.reflect.*
 
-abstract class SemaphoreLCStressTestBase(semaphore: Semaphore, seqSpec: KClass<*>) : VerifierState() {
+abstract class SemaphoreLCStressTestBase(semaphore: Semaphore, val seqSpec: KClass<*>) {
     private val s = semaphore
 
     @Operation
@@ -24,18 +24,17 @@ abstract class SemaphoreLCStressTestBase(semaphore: Semaphore, seqSpec: KClass<*
     @Operation(handleExceptionsAsResult = [IllegalStateException::class])
     fun release() = s.release()
 
-    override fun extractState() = s.availablePermits
-
     open fun Options<*, *>.customize(): Options<*, *> = this
 
     @Test
     fun test() = LCStressOptionsDefault()
         .actorsBefore(0)
+        .sequentialSpecification(seqSpec.java)
         .customize()
         .check(this::class)
 }
 
-open class SemaphoreSequential(val permits: Int) {
+open class SemaphoreSequential(val permits: Int) : VerifierState() {
     private var availablePermits = permits
     private val waiters = ArrayList<CancellableContinuation<Unit>>()
 
@@ -47,6 +46,7 @@ open class SemaphoreSequential(val permits: Int) {
 
     suspend fun acquire() {
         if (tryAcquire()) return
+        availablePermits--
         suspendAtomicCancellableCoroutine<Unit> { cont ->
             waiters.add(cont)
         }
@@ -54,12 +54,14 @@ open class SemaphoreSequential(val permits: Int) {
 
     fun release() {
         while (true) {
-            check(availablePermits < permits)
-            if (availablePermits++ > 0) return
+            availablePermits++
+            if (availablePermits > 0) return
             val w = waiters.removeAt(0)
             if (w.tryResume0(Unit)) return
         }
     }
+
+    override fun extractState() = availablePermits.coerceAtLeast(0)
 }
 
 class SemaphoreSequential1 : SemaphoreSequential(1)

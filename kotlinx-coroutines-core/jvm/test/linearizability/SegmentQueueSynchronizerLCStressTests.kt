@@ -27,16 +27,16 @@ import kotlin.reflect.jvm.*
   synchronization primitives.
  */
 
-internal class SimpleSemaphoreAsync(val permits: Int) : SegmentQueueSynchronizer<Unit>(ASYNC), Semaphore {
+internal class SimpleSemaphoreAsync(permits: Int) : SegmentQueueSynchronizer<Unit>(ASYNC), Semaphore {
     private val _availablePermits = atomic(permits)
-    override val availablePermits = _availablePermits.value.coerceAtLeast(0)
+    override val availablePermits get() = error("Not implemented")
 
     override suspend fun acquire() {
         val p = _availablePermits.getAndDecrement()
         // Is the lock acquired?
         if (p > 0) return
         // Suspend otherwise
-        suspendAtomicCancellableCoroutineReusable<Unit> { cont ->
+        suspendAtomicCancellableCoroutine<Unit> { cont ->
             check(suspend(cont)) { "Should not fail in ASYNC mode" }
         }
     }
@@ -49,6 +49,42 @@ internal class SimpleSemaphoreAsync(val permits: Int) : SegmentQueueSynchronizer
             if (p >= 0) return // no waiters
             if (tryResume(Unit)) return // can fail due to cancellation
         }
+    }
+}
+
+internal class SimpleSemaphoreAsyncSmart(permits: Int) : SegmentQueueSynchronizer<Unit>(ASYNC), Semaphore {
+    private val _availablePermits = atomic(permits)
+    override val availablePermits get() = error("Not implemented")
+
+    override suspend fun acquire() {
+        val p = _availablePermits.getAndDecrement()
+        // Is the lock acquired?
+        if (p > 0) return
+        // Suspend otherwise
+        suspendMyAtomicCancellableCoroutine(this::onCancellation) { cont ->
+            check(suspend(cont)) { "Should not fail in ASYNC mode" }
+        }
+    }
+
+    private fun onCancellation(cont: MyCancellableContinuationImpl<Unit>): Boolean {
+        // TODO note that this code works only because
+        // TODO cancellation can be invoked at most once.
+        val p = _availablePermits.getAndIncrement()
+        if (p >= 0) return false
+        if (!cont.cancelImpl()) {
+            resume(Unit)
+            return true
+        } else {
+            return true
+        }
+    }
+
+    override fun tryAcquire() =  error("Not supported in the ASYNC version")
+
+    override fun release() {
+        val p = _availablePermits.getAndIncrement()
+        if (p >= 0) return // no waiters
+        resume(Unit)
     }
 }
 
@@ -88,6 +124,14 @@ abstract class SemaphoreAsyncLCStressTestBase(semaphore: Semaphore, seqSpec: KCl
 class SemaphoreAsync1LCStressTest : SemaphoreAsyncLCStressTestBase(SimpleSemaphoreAsync(1), SemaphoreSequential1::class)
 class SemaphoreAsync2LCStressTest : SemaphoreAsyncLCStressTestBase(SimpleSemaphoreAsync(2), SemaphoreSequential2::class)
 
+class SemaphoreAsyncSmart1LCStressTest : SemaphoreAsyncLCStressTestBase(SimpleSemaphoreAsyncSmart(1), SemaphoreSequential1::class)
+class SemaphoreAsyncSmart2LCStressTest : SemaphoreAsyncLCStressTestBase(SimpleSemaphoreAsyncSmart(2), SemaphoreSequential2::class)
+
+
+
+
+
+
 
 internal class SimpleCountDownLatch(count: Int) : SegmentQueueSynchronizer<Unit>(ASYNC) {
     private val count = atomic(count)
@@ -113,7 +157,7 @@ internal class SimpleCountDownLatch(count: Int) : SegmentQueueSynchronizer<Unit>
         // add a new waiter (checking the counter again)
         val w = waiters.incrementAndGet()
         if (w and DONE_MARK != 0) return
-        suspendAtomicCancellableCoroutineReusable<Unit> { suspend(it) }
+        suspendAtomicCancellableCoroutine<Unit> { suspend(it) }
     }
 
     fun remaining(): Int = count.value.coerceAtLeast(0)
@@ -170,6 +214,12 @@ class SimpleCountDownLatchSequential2 : SimpleCountDownLatchSequential(2)
 class SimpleCountDownLatch2LCStressTest : SimpleCountDownLatchLCStressTest(2, SimpleCountDownLatchSequential2::class)
 
 
+
+
+
+
+
+
 internal class SimpleBarrier(private val parties: Int) : SegmentQueueSynchronizer<Boolean>(ASYNC) {
     private val arrived = atomic(0L)
 
@@ -189,13 +239,15 @@ internal class SimpleBarrier(private val parties: Int) : SegmentQueueSynchronize
         }
     }
 
-    private fun onCancellation(cont: CancellableContinuation<Boolean>) {
+    private fun onCancellation(cont: MyCancellableContinuationImpl<Boolean>): Boolean {
         arrived.loop { cur ->
             if (cur >= parties) {
                 cont.tryResume0(true)
-                return
+                return false
             } else {
-                if (arrived.compareAndSet(cur, cur - 1)) return
+                // TODO this code works only because we guarantee
+                // TODO that cancellation can be invoked at most once.
+                if (arrived.compareAndSet(cur, cur - 1)) return false
             }
         }
     }
@@ -248,6 +300,11 @@ class SimpleBarrierSequential1 : SimpleBarrierSequential(1)
 class SimpleBarrier1LCStressTest : SimpleBarrierLCStressTest(1, SimpleBarrierSequential1::class)
 class SimpleBarrierSequential2 : SimpleBarrierSequential(2)
 class SimpleBarrier2LCStressTest : SimpleBarrierLCStressTest(2, SimpleBarrierSequential2::class)
+class SimpleBarrierSequential3 : SimpleBarrierSequential(3)
+class SimpleBarrier3LCStressTest : SimpleBarrierLCStressTest(3, SimpleBarrierSequential3::class)
+
+
+
 
 
 
@@ -283,7 +340,7 @@ internal class SimpleBlockingQueue<T: Any> : SegmentQueueSynchronizer<T>(SYNC) {
                 val x = tryRetrieve()
                 if (x != null) return x
             } else {
-                val x = suspendAtomicCancellableCoroutineReusable<T?> { cont ->
+                val x = suspendAtomicCancellableCoroutine<T?> { cont ->
                     if (!suspend(cont)) cont.resume(null)
                 }
                 if (x != null) return x
@@ -347,6 +404,13 @@ class SimpleBlockingQueueLCStressTest {
 }
 
 
+
+
+
+
+
+
+
 internal class SimpleBlockingStack<T: Any> : SegmentQueueSynchronizer<T>(SYNC) {
     private val head = atomic<StackNode<T>?>(null)
     private val balance = atomic(0) // #put - #pop
@@ -381,7 +445,7 @@ internal class SimpleBlockingStack<T: Any> : SegmentQueueSynchronizer<T>(SYNC) {
                 val x = tryRetrieve()
                 if (x != null) return x
             } else {
-                val x = suspendAtomicCancellableCoroutineReusable<T?> { cont ->
+                val x = suspendAtomicCancellableCoroutine<T?> { cont ->
                     if (!suspend(cont)) cont.resume(null)
                 }
                 if (x != null) return x
@@ -448,24 +512,41 @@ class SimpleBlockingStackLCStressTest {
 }
 
 
+
+
+
+
+
+
 private fun <T> CancellableContinuation<T>.tryResume0(value: T): Boolean {
     val token = tryResume(value) ?: return false
     completeResume(token)
     return true
 }
 
-internal class MyCancellableContinuationImpl<T>(delegate: Continuation<T>, resumeMode: Int, val beforeCancelAction: (CancellableContinuation<T>) -> Unit)
-    : CancellableContinuationImpl<T>(delegate, resumeMode) {
+
+internal class MyCancellableContinuationImpl<T>(
+    delegate: Continuation<T>,
+    resumeMode: Int,
+    val beforeCancelAction: (MyCancellableContinuationImpl<T>) -> Boolean
+) : CancellableContinuationImpl<T>(delegate, resumeMode) {
+
+    private val firstCancel = atomic(false)
 
     override fun cancel(cause: Throwable?): Boolean {
-        beforeCancelAction(this)
-        return super.cancel(cause)
+        // Is this the first `cancel` invocation?
+        if (!firstCancel.compareAndSet(false, true)) return false
+        // Perform the cancellation
+        if (beforeCancelAction(this)) return true
+        return cancelImpl(cause)
     }
+
+    fun cancelImpl(cause: Throwable? = null): Boolean  = super.cancel(cause)
 }
 
 internal suspend inline fun <T> suspendMyAtomicCancellableCoroutine(
-    noinline beforeCancelAction: (CancellableContinuation<T>) -> Unit,
-    crossinline block: (CancellableContinuation<T>) -> Unit
+    noinline beforeCancelAction: (MyCancellableContinuationImpl<T>) -> Boolean,
+    crossinline block: (CancellableContinuationImpl<T>) -> Unit
 ): T =
     suspendCoroutineUninterceptedOrReturn { uCont ->
         val cancellable = MyCancellableContinuationImpl(uCont.intercepted(), MODE_ATOMIC_DEFAULT, beforeCancelAction)

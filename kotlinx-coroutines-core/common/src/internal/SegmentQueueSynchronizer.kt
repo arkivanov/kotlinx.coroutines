@@ -111,6 +111,10 @@ internal open class SegmentQueueSynchronizer<T>(val mode: Mode) {
         }
     }
 
+    fun resume(value: T) {
+        while(!tryResume(value)) {}
+    }
+
     internal enum class Mode { SYNC, ASYNC }
 }
 
