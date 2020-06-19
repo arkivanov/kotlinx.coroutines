@@ -64,10 +64,10 @@ import kotlin.native.concurrent.*
  *  +---------+    |
  *  | element | --<
  *  +---------+   |
- *  |
- *  | `tryResume` has waited a bounded time   +--------+
- *  +---------------------------------------> | BROKEN | (BOTH `suspend` AND `tryResume` FAIL)
- *         but `suspend` has not come         +--------+
+ *                |
+ *                | `tryResume` has waited a bounded time   +--------+
+ *                +---------------------------------------> | BROKEN | (BOTH `suspend` AND `tryResume` FAIL)
+ *                       but `suspend` has not come         +--------+
  *
  *  As for the infinite array implementation, it is organized as a linked list of [segments][SQSSegment];
  *  each segment contains a fixed number of cells. To determine the cell for each [suspend] and [tryResume]
