@@ -8,7 +8,7 @@ package kotlinx.coroutines.linearizability
 import kotlinx.atomicfu.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.internal.*
-import kotlinx.coroutines.internal.SegmentQueueSynchronizer.ResumeMode.*
+import kotlinx.coroutines.internal.SegmentQueueSynchronizer.Mode.*
 import kotlinx.coroutines.sync.*
 import org.jetbrains.kotlinx.lincheck.*
 import org.jetbrains.kotlinx.lincheck.annotations.Operation
@@ -16,7 +16,6 @@ import org.jetbrains.kotlinx.lincheck.execution.*
 import org.jetbrains.kotlinx.lincheck.verifier.*
 import org.junit.*
 import kotlin.coroutines.*
-import kotlin.coroutines.intrinsics.*
 import kotlin.random.*
 import kotlin.reflect.*
 import kotlin.reflect.jvm.*
@@ -38,13 +37,16 @@ import kotlin.reflect.jvm.*
 // without contention (independently on the number of cancelled requests)
 // but requires some non-trivial tricks and much more complicated analysis.
 
-internal class AsyncSemaphore(permits: Int) : SegmentQueueSynchronizer<Unit>(), Semaphore {
+internal abstract class AsyncSemaphoreBase(permits: Int, mode: Mode) : SegmentQueueSynchronizer<Unit>(mode), Semaphore {
     private val _availablePermits = atomic(permits)
     override val availablePermits get() = error("Not implemented")
 
+    fun incPermits() = _availablePermits.getAndIncrement()
+    fun decPermits() = _availablePermits.getAndDecrement()
+
     override suspend fun acquire() {
-        val p = _availablePermits.getAndDecrement()
-        // Is the lock acquired?
+        val p = decPermits()
+        // Is the permit acquired?
         if (p > 0) return
         // Suspend otherwise
         suspendAtomicCancellableCoroutine<Unit> { cont ->
@@ -53,47 +55,28 @@ internal class AsyncSemaphore(permits: Int) : SegmentQueueSynchronizer<Unit>(), 
     }
 
     override fun tryAcquire() =  error("Not supported in the ASYNC version")
+}
 
+internal class AsyncSemaphore(permits: Int) : AsyncSemaphoreBase(permits, ASYNC) {
     override fun release() {
         while (true) {
-            val p = _availablePermits.getAndIncrement()
+            val p = incPermits()
             if (p >= 0) return // no waiters
-            if (tryResume(Unit, resumeMode = ASYNC)) return // can fail due to cancellation
+            if (tryResume(Unit)) return // can fail due to cancellation
         }
     }
 }
 
-internal class AsyncSemaphoreSmart(permits: Int) : SegmentQueueSynchronizer<Unit>(), Semaphore {
-    private val _availablePermits = atomic(permits)
-    override val availablePermits get() = error("Not implemented")
-
-    override suspend fun acquire() {
-        val p = _availablePermits.getAndDecrement()
-        // Is the lock acquired?
-        if (p > 0) return
-        // Suspend otherwise
-        suspendMyAtomicCancellableCoroutine(this::onCancellation) { cont ->
-            check(suspend(cont)) { "Should not fail in ASYNC mode" }
-        }
-    }
-
-    private fun onCancellation(cont: MyCancellableContinuationImpl<Unit>): Boolean {
-        val p = _availablePermits.getAndIncrement()
-        if (p >= 0) return false
-        if (!cont.cancelImpl()) {
-            resume(Unit, resumeMode = ASYNC)
-            return true
-        } else {
-            return true
-        }
-    }
-
-    override fun tryAcquire() =  error("Not supported in the ASYNC version")
-
+internal class AsyncSemaphoreSmart(permits: Int) : AsyncSemaphoreBase(permits, ASYNC_SMART) {
     override fun release() {
-        val p = _availablePermits.getAndIncrement()
+        val p = incPermits()
         if (p >= 0) return // no waiters
-        resume(Unit, resumeMode = ASYNC)
+        resume(Unit)
+    }
+
+    override fun onCancellation(): Boolean {
+        val p = incPermits()
+        return p >= 0
     }
 }
 
@@ -107,7 +90,17 @@ abstract class AsyncSemaphoreLCStressTestBase(semaphore: Semaphore, seqSpec: KCl
     {
         override fun nextExecution() = ExecutionScenario(
             emptyList(),
-            generateParallelPart(testConfiguration.threads, testConfiguration.actorsPerThread),
+            listOf(
+                listOf(
+                    Actor(AsyncSemaphoreLCStressTestBase::acquire.javaMethod!!, emptyList(), emptyList())
+                ),
+                listOf(
+                    Actor(AsyncSemaphoreLCStressTestBase::acquire.javaMethod!!, emptyList(), emptyList()),
+                    Actor(AsyncSemaphoreLCStressTestBase::acquire.javaMethod!!, emptyList(), emptyList(), cancelOnSuspension = true),
+                    Actor(AsyncSemaphoreLCStressTestBase::release.javaMethod!!, emptyList(), emptyList())
+                )
+            ),
+//            generateParallelPart(testConfiguration.threads, testConfiguration.actorsPerThread),
             emptyList()
         )
 
@@ -141,7 +134,8 @@ class AsyncSemaphoreSmart2LCStressTest : AsyncSemaphoreLCStressTestBase(AsyncSem
 // # COUNT-DOWN-LATCH SYNCHRONIZATION #
 // ####################################
 
-internal class CountDownLatch(count: Int) : SegmentQueueSynchronizer<Unit>() { // TODO smart cancellation?
+// TODO smart version?
+internal class CountDownLatch(count: Int) : SegmentQueueSynchronizer<Unit>(ASYNC_SMART) {
     private val count = atomic(count)
     private val waiters = atomic(0)
 
@@ -150,13 +144,18 @@ internal class CountDownLatch(count: Int) : SegmentQueueSynchronizer<Unit>() { /
         if (r <= 0) releaseWaiters()
     }
 
+    override fun onCancellation(): Boolean {
+        val w = waiters.decrementAndGet()
+        return (w and DONE_MARK) != 0
+    }
+
     private fun releaseWaiters() {
-        val w = waiters.getAndUpdate {
+        val w = waiters.getAndUpdate { cur ->
             // is the mark set?
-            if (it and DONE_MARK != 0) return
-            it or DONE_MARK
+            if (cur and DONE_MARK != 0) return
+            cur or DONE_MARK
         }
-        repeat(w) { tryResume(Unit, resumeMode = ASYNC) }
+        repeat(w) { resume(Unit) }
     }
 
     suspend fun await() {
@@ -225,18 +224,19 @@ open class CountDownLatchSequential(initialCount: Int) : VerifierState() {
 // # BARRIER SYNCHRONIZATION #
 // ###########################
 
-internal class Barrier(private val parties: Int) : SegmentQueueSynchronizer<Boolean>() {
+internal class Barrier(private val parties: Int) : SegmentQueueSynchronizer<Unit>(ASYNC_SMART) {
     private val arrived = atomic(0L)
 
     suspend fun arrive(): Boolean {
         val a = arrived.incrementAndGet()
         return when {
             a < parties -> {
-                suspendMyAtomicCancellableCoroutine(this::onCancellation) { cont -> suspend(cont) }
+                suspendAtomicCancellableCoroutine<Unit> { cont -> suspend(cont) }
+                true
             }
             a == parties.toLong() -> {
                 repeat(parties - 1) {
-                    tryResume(true, resumeMode = ASYNC)
+                    tryResume(Unit)
                 }
                 true
             }
@@ -244,22 +244,19 @@ internal class Barrier(private val parties: Int) : SegmentQueueSynchronizer<Bool
         }
     }
 
-    private fun onCancellation(cont: MyCancellableContinuationImpl<Boolean>): Boolean {
+    override fun onCancellation(): Boolean {
         arrived.loop { cur ->
-            if (cur >= parties) {
-                cont.tryResume0(true)
-                return false
-            } else {
-                if (arrived.compareAndSet(cur, cur - 1)) return false
-            }
+            if (cur == parties.toLong()) return true // just ignore the result
+            if (arrived.compareAndSet(cur, cur - 1)) return false
         }
     }
 }
+// TODO: non-atomic cancellation test?
 
 abstract class BarrierLCStressTestBase(parties: Int, val seqSpec: KClass<*>) {
     private val b = Barrier(parties)
 
-    @Operation
+    @Operation(cancellableOnSuspension = false)
     suspend fun arrive() = b.arrive()
 
     @Test
@@ -316,7 +313,7 @@ interface BlockingPool<T: Any> {
     suspend fun retrieve(): T
 }
 
-internal class BlockingQueuePool<T: Any> : SegmentQueueSynchronizer<T>(), BlockingPool<T> {
+internal class BlockingQueuePool<T: Any> : SegmentQueueSynchronizer<T>(SYNC), BlockingPool<T> {
     private val balance = atomic(0L) // #put  - #retrieve
 
     private val elements = atomicArrayOfNulls<Any?>(100) // This is an infinite array by design :)
@@ -327,7 +324,7 @@ internal class BlockingQueuePool<T: Any> : SegmentQueueSynchronizer<T>(), Blocki
         while (true) {
             val b = balance.getAndIncrement()
             if (b < 0) {
-                if (tryResume(element, resumeMode = SYNC)) return
+                if (tryResume(element)) return
             } else {
                 if (tryInsert(element)) return
             }
@@ -366,7 +363,7 @@ internal class BlockingQueuePool<T: Any> : SegmentQueueSynchronizer<T>(), Blocki
     }
 }
 
-internal class BlockingStackPool<T: Any> : SegmentQueueSynchronizer<T>(), BlockingPool<T> {
+internal class BlockingStackPool<T: Any> : SegmentQueueSynchronizer<T>(SYNC), BlockingPool<T> {
     private val head = atomic<StackNode<T>?>(null)
     private val balance = atomic(0) // #put - #retrieve
 
@@ -374,7 +371,7 @@ internal class BlockingStackPool<T: Any> : SegmentQueueSynchronizer<T>(), Blocki
         while (true) {
             val b = balance.getAndIncrement()
             if (b < 0) {
-                if (tryResume(element, resumeMode = SYNC)) return
+                if (tryResume(element)) return
             } else {
                 if (tryInsert(element)) return
             }
@@ -477,33 +474,3 @@ private fun <T> CancellableContinuation<T>.tryResume0(value: T): Boolean {
     completeResume(token)
     return true
 }
-
-
-internal class MyCancellableContinuationImpl<T>(
-    delegate: Continuation<T>,
-    resumeMode: Int,
-    val beforeCancelAction: (MyCancellableContinuationImpl<T>) -> Boolean
-) : CancellableContinuationImpl<T>(delegate, resumeMode) {
-
-    private val firstCancel = atomic(false)
-
-    override fun cancel(cause: Throwable?): Boolean {
-        // Is this the first `cancel` invocation?
-        if (!firstCancel.compareAndSet(false, true)) return false
-        // Perform the cancellation
-        if (beforeCancelAction(this)) return true
-        return cancelImpl(cause)
-    }
-
-    fun cancelImpl(cause: Throwable? = null): Boolean  = super.cancel(cause)
-}
-
-internal suspend inline fun <T> suspendMyAtomicCancellableCoroutine(
-    noinline beforeCancelAction: (MyCancellableContinuationImpl<T>) -> Boolean,
-    crossinline block: (CancellableContinuationImpl<T>) -> Unit
-): T =
-    suspendCoroutineUninterceptedOrReturn { uCont ->
-        val cancellable = MyCancellableContinuationImpl(uCont.intercepted(), MODE_ATOMIC_DEFAULT, beforeCancelAction)
-        block(cancellable)
-        cancellable.getResult()
-    }

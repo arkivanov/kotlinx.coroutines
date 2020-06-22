@@ -6,8 +6,8 @@ package kotlinx.coroutines.internal
 
 import kotlinx.atomicfu.*
 import kotlinx.coroutines.*
-import kotlinx.coroutines.flow.internal.*
 import kotlinx.coroutines.flow.internal.DONE
+import kotlinx.coroutines.internal.SegmentQueueSynchronizer.Mode.*
 import kotlinx.coroutines.sync.*
 import kotlin.coroutines.*
 import kotlin.native.concurrent.*
@@ -25,7 +25,7 @@ import kotlin.native.concurrent.*
  * continuation into the cell. At the same time, [tryResume] increments its own counter and comes to the
  * corresponding cell.
  *
- * Since [suspend] stores [CancellableContinuation]-s, it is possible for [tryResume] to fail if the
+ * Since [suspend] can store [CancellableContinuation]-s, it is possible for [tryResume] to fail if the
  * continuation is already cancelled. In this case, most of the algorithms retry the whole operation.
  * However, some solutions may invoke [tryResume] until it succeeds, so that [SegmentQueueSynchronizer]
  * is provided with a nice short-cut [resume], which also efficiently skips consecutive cancelled continuations.
@@ -34,11 +34,11 @@ import kotlin.native.concurrent.*
  * (e.g., [Semaphore] modifies the number of available permits), and invoke [suspend] or [tryResume]
  * after that. Following this pattern, it is possible in a concurrent environment that [tryResume]
  * is executed before [suspend] (similarly to the race between `park` and `unpark` for threads),
- * so that [tryResume] comes to an empty cell. This race can be solved with two [strategies][ResumeMode]:
- * [asynchronous][ResumeMode.ASYNC] and [synchronous][ResumeMode.SYNC].
- * In the [synchronous][ResumeMode.ASYNC] mode, [tryResume] puts the element if the cell is empty
+ * so that [tryResume] comes to an empty cell. This race can be solved with two [strategies][Mode]:
+ * [asynchronous][Mode.ASYNC] and [synchronous][Mode.SYNC].
+ * In the [synchronous][Mode.ASYNC] mode, [tryResume] puts the element if the cell is empty
  * and finishes, the next [suspend] comes to this cell and simply grabs the element without suspension.
- * At the same time, in the [synchronous][ResumeMode.SYNC] mode, [tryResume] waits in a bounded spin-loop
+ * At the same time, in the [synchronous][Mode.SYNC] mode, [tryResume] waits in a bounded spin-loop
  * until the put element is taken, marking the cell as broken if it is not after all. In this case both
  * the current [tryResume] and the [suspend] that comes to this broken cell fail.
  *
@@ -48,19 +48,19 @@ import kotlin.native.concurrent.*
  *  +------+ `suspend` succeeds   +------+  `tryResume` tries   +------+                        // if `cont.tryResume(..)` succeeds, then
  *  | NULL | -------------------> | cont | -------------------> | DONE | (`cont` IS RETRIEVED)  // the corresponding `tryResume` succeeds gets
  *  +------+                      +------+   to resume `cont`   +------+                        // as well, fails otherwise.
- *  |                             |
- *  |                             | The suspended request is cancelled and the continuation is
- *  | `tryResume` comes           | replaced with a special `CANCELLED` token to avoid memory leaks.
- *  | to the cell before          V
- *  | `suspend` and puts    +-----------+
- *  | the element into      | CANCELLED |  (`cont` IS CANCELLED, `tryResume` FAILS)
- *  | the cell, waiting     +-----------+
- *  | for `suspend` in
- *  | ASYNC mode.
- *  |
- *  |                 `suspend` gets   +-------+  ( ELIMINATION HAPPENED, )
- *  |              +-----------------> | TAKEN |  ( BOTH `tryResume` and  )
- *  V              |    the element    +-------+  ( `suspend` SUCCEED     )
+ *     |                             |
+ *     |                             | The suspended request is cancelled and the continuation is
+ *     | `tryResume` comes           | replaced with a special `CANCELLED` token to avoid memory leaks.
+ *     | to the cell before          V
+ *     | `suspend` and puts    +-----------+
+ *     | the element into      | CANCELLED |  (`cont` IS CANCELLED, `tryResume` FAILS)
+ *     | the cell, waiting     +-----------+
+ *     | for `suspend` in
+ *     | ASYNC mode.
+ *     |
+ *     |              `suspend` gets   +-------+  ( ELIMINATION HAPPENED, )
+ *     |           +-----------------> | TAKEN |  ( BOTH `tryResume` and  )
+ *     V           |    the element    +-------+  ( `suspend` SUCCEED     )
  *  +---------+    |
  *  | element | --<
  *  +---------+   |
@@ -75,7 +75,7 @@ import kotlin.native.concurrent.*
  *  finds the required segment starting from the initially read one.
  */
 @InternalCoroutinesApi
-internal open class SegmentQueueSynchronizer<T> {
+internal open class SegmentQueueSynchronizer<T>(val mode: Mode) {
     private val head: AtomicRef<SQSSegment>
     private val deqIdx = atomic(0L)
     private val tail: AtomicRef<SQSSegment>
@@ -92,7 +92,7 @@ internal open class SegmentQueueSynchronizer<T> {
      * Returns `false` if the received permit cannot be used and the calling operation should restart.
      */
     @Suppress("UNCHECKED_CAST")
-    fun suspend(cont: CancellableContinuation<T>): Boolean {
+    fun suspend(cont: Continuation<T>): Boolean {
         val curTail = this.tail.value
         val enqIdx = enqIdx.getAndIncrement()
         val segment = this.tail.findSegmentAndMoveForward(id = enqIdx / SEGMENT_SIZE, startFrom = curTail,
@@ -100,7 +100,9 @@ internal open class SegmentQueueSynchronizer<T> {
         val i = (enqIdx % SEGMENT_SIZE).toInt()
         // the regular (fast) path -- if the cell is empty, try to install continuation
         if (segment.cas(i, null, cont)) { // try to install the continuation
-            cont.invokeOnCancellation(CancelSemaphoreAcquisitionHandler(segment, i).asHandler)
+            if (cont is CancellableContinuation<*>) {
+                cont.invokeOnCancellation(SQSCancellationHandler(this, segment, i).asHandler)
+            }
             return true
         }
         // On CAS failure -- the cell must either contain a value or be broken.
@@ -117,19 +119,19 @@ internal open class SegmentQueueSynchronizer<T> {
     /**
      * TODO
      */
-    fun tryResume(value: T, resumeMode: ResumeMode): Boolean = tryResumeImpl(value, resumeMode, enhanceDeqIdx = false)
+    fun tryResume(value: T): Boolean = tryResumeImpl(value, adjustDeqIdx = false)
 
     /**
      * Essentially, this is a short-cut for `while (!tryResume(..)) {}`, but
      * works in O(1) without contention independently on how many
      * [suspended][suspend] continuations has been cancelled.
      */
-    fun resume(value: T, resumeMode: ResumeMode) {
-        while (!tryResumeImpl(value, resumeMode, enhanceDeqIdx = true)) { /* try again */ }
+    fun resume(value: T) {
+        while (!tryResumeImpl(value, adjustDeqIdx = true)) { /* try again */ }
     }
 
     @Suppress("UNCHECKED_CAST")
-    private fun tryResumeImpl(value: T, resumeMode: ResumeMode, enhanceDeqIdx: Boolean): Boolean {
+    private fun tryResumeImpl(value: T, adjustDeqIdx: Boolean): Boolean {
         val curHead = this.head.value
         val deqIdx = deqIdx.getAndIncrement()
         val id = deqIdx / SEGMENT_SIZE
@@ -137,7 +139,7 @@ internal open class SegmentQueueSynchronizer<T> {
             createNewSegment = ::createSegment).segment // cannot be closed
         segment.cleanPrev()
         if (segment.id > id) {
-            if (enhanceDeqIdx) enhanceDeqIdx(segment.id * SEGMENT_SIZE)
+            if (adjustDeqIdx) adjustDeqIdx(segment.id * SEGMENT_SIZE)
             return false
         }
         val i = (deqIdx % SEGMENT_SIZE).toInt()
@@ -147,7 +149,7 @@ internal open class SegmentQueueSynchronizer<T> {
                 cellState === null -> {
                     if (!segment.cas(i, null, value)) continue@modify_cell
                     // Return immediately in the async mode
-                    if (resumeMode == ResumeMode.ASYNC) return true
+                    if (mode.async) return true
                     // Acquire has not touched this cell yet, wait until it comes for a bounded time
                     // The cell state can only transition from PERMIT to TAKEN by addAcquireToQueue
                     repeat(MAX_SPIN_CYCLES) {
@@ -156,20 +158,48 @@ internal open class SegmentQueueSynchronizer<T> {
                     // Try to break the slot in order not to wait
                     return !segment.cas(i, value, BROKEN)
                 }
-                cellState === CANCELLED -> return false // the acquire was already cancelled
-                else -> { // continuation
-                    if (!segment.cas(i, cellState, DONE)) continue@modify_cell
-                    return (cellState as CancellableContinuation<T>).tryResume0(value)
+                cellState === CANCELLING -> {
+                    if (segment.cas(i, CANCELLING, value)) return true
+                }
+                cellState === CANCELLED -> {
+                    return false
+                } // the acquire was already cancelled
+                cellState === IGNORE -> return true
+                cellState is CancellableContinuation<*> -> {
+                    val success = (cellState as CancellableContinuation<T>).tryResume0(value)
+                    if (success) {
+                        segment.set(i, DONE)
+                        return true
+                    }
+                    if (mode != ASYNC_SMART) return false
+                    if (!segment.cas(i, cellState, CANCELLING)) continue@modify_cell
+                    val ignore = onCancellation()
+                    if (ignore) {
+                        segment.set(i, IGNORE)
+                        return true
+                    } else {
+                        segment.set(i, CANCELLED)
+                        return false
+                    }
+                }
+                else -> {
+                    (cellState as Continuation<T>).resume(value)
+                    segment.set(i, DONE)
+                    return true
                 }
             }
         }
-
     }
 
-    private fun enhanceDeqIdx(newValue: Long): Unit = deqIdx.loop { cur ->
+    private fun adjustDeqIdx(newValue: Long): Unit = deqIdx.loop { cur ->
         if (cur >= newValue) return
         if (deqIdx.compareAndSet(cur, newValue)) return
     }
+
+    /**
+     * TODO
+     */
+    open fun onCancellation() : Boolean = false
 
     /**
      * These modes define the strategy that [tryResume] and [resume] should
@@ -185,7 +215,11 @@ internal open class SegmentQueueSynchronizer<T> {
      * as [broken][BROKEN] and failing if it is not, so that the corresponding
      * [suspend] invocation finds the cell [broken][BROKEN] and fails as well.
      */
-    internal enum class ResumeMode { SYNC, ASYNC }
+    internal enum class Mode(val async: Boolean) {
+        SYNC(false),
+        ASYNC(true),
+        ASYNC_SMART(true)
+    }
 }
 
 private fun <T> CancellableContinuation<T>.tryResume0(value: T): Boolean {
@@ -194,15 +228,34 @@ private fun <T> CancellableContinuation<T>.tryResume0(value: T): Boolean {
     return true
 }
 
-private class CancelSemaphoreAcquisitionHandler(
+private class SQSCancellationHandler<T>(
+    private val sqs: SegmentQueueSynchronizer<T>,
     private val segment: SQSSegment,
     private val index: Int
 ) : CancelHandler() {
     override fun invoke(cause: Throwable?) {
-        segment.cancel(index)
+        if (sqs.mode != ASYNC_SMART) {
+            segment.cancel(index)
+            return
+        }
+        val cellState = segment.get(index)
+        if (cellState === CANCELLING || cellState === CANCELLED || cellState === IGNORE) return
+        if (!segment.cas(index, cellState, CANCELLING)) {
+            return
+        }
+        val ignore = sqs.onCancellation()
+        if (ignore) {
+            segment.set(index, IGNORE)
+        } else {
+            if (segment.cas(index, CANCELLING, CANCELLED)) return
+            val value = segment.get(index) as T
+            segment.set(index, CANCELLED)
+            segment.onSlotCleaned()
+            sqs.resume(value)
+        }
     }
 
-    override fun toString() = "CancelSemaphoreAcquisitionHandler[$segment, $index]"
+    override fun toString() = "SQSCancellationHandler[$segment, $index]"
 }
 
 private fun createSegment(id: Long, prev: SQSSegment?) = SQSSegment(id, prev, 0)
@@ -224,11 +277,14 @@ private class SQSSegment(id: Long, prev: SQSSegment?, pointers: Int) : Segment<S
 
     // Cleans the acquirer slot located by the specified index
     // and removes this segment physically if all slots are cleaned.
-    fun cancel(index: Int) {
+    fun cancel(index: Int): Boolean {
         // Clean the slot
-        set(index, CANCELLED)
+        val cur = get(index)
+        if (cur === CANCELLED) return false
+        if (!cas(index, cur, CANCELLED)) return false
         // Remove this segment if needed
         onSlotCleaned()
+        return true
     }
 
     override fun toString() = "SQSSegment[id=$id, hashCode=${hashCode()}]"
@@ -243,4 +299,8 @@ private val TAKEN = Symbol("TAKEN")
 @SharedImmutable
 private val BROKEN = Symbol("BROKEN")
 @SharedImmutable
+private val CANCELLING = Symbol("CANCELLING")
+@SharedImmutable
 private val CANCELLED = Symbol("CANCELLED")
+@SharedImmutable
+private val IGNORE = Symbol("IGNORE")
