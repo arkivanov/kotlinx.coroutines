@@ -8,6 +8,8 @@ package kotlinx.coroutines.linearizability
 import kotlinx.atomicfu.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.internal.*
+import kotlinx.coroutines.internal.SegmentQueueSynchronizer.CancellationMode.*
+import kotlinx.coroutines.internal.SegmentQueueSynchronizer.ResumeMode.*
 import kotlinx.coroutines.sync.*
 import org.jetbrains.kotlinx.lincheck.*
 import org.jetbrains.kotlinx.lincheck.annotations.Operation
@@ -37,7 +39,7 @@ import kotlin.reflect.jvm.*
 // but requires some non-trivial tricks and much more complicated analysis.
 
 internal abstract class AsyncSemaphoreBase(permits: Int) : SegmentQueueSynchronizer<Unit>(), Semaphore {
-    override val resumeMode get() = ResumeMode.ASYNC
+    override val resumeMode get() = ASYNC
 
     private val _availablePermits = atomic(permits)
     override val availablePermits get() = error("Not implemented")
@@ -69,7 +71,7 @@ internal class AsyncSemaphore(permits: Int) : AsyncSemaphoreBase(permits) {
 }
 
 internal class AsyncSemaphoreSmart(permits: Int) : AsyncSemaphoreBase(permits) {
-    override val cancellationMode: CancellationMode get() = CancellationMode.SMART
+    override val cancellationMode: CancellationMode get() = SMART
 
     override fun release() {
         val p = incPermits()
@@ -138,8 +140,8 @@ class AsyncSemaphoreSmart2LCStressTest : AsyncSemaphoreLCStressTestBase(AsyncSem
 // ####################################
 
 internal class CountDownLatch(count: Int) : SegmentQueueSynchronizer<Unit>() {
-    override val resumeMode: ResumeMode get() = ResumeMode.ASYNC
-    override val cancellationMode: CancellationMode get() = CancellationMode.SMART
+    override val resumeMode: ResumeMode get() = ASYNC
+    override val cancellationMode: CancellationMode get() = SMART
 
     private val count = atomic(count)
     private val waiters = atomic(0)
@@ -230,8 +232,8 @@ open class CountDownLatchSequential(initialCount: Int) : VerifierState() {
 // ###########################
 
 internal class Barrier(private val parties: Int) : SegmentQueueSynchronizer<Unit>() {
-    override val resumeMode: ResumeMode get() = ResumeMode.ASYNC
-    override val cancellationMode: CancellationMode get() = CancellationMode.SMART
+    override val resumeMode: ResumeMode get() = ASYNC
+    override val cancellationMode: CancellationMode get() = SMART
 
     private val arrived = atomic(0L)
 
@@ -316,52 +318,109 @@ open class BarrierSequential(parties: Int) : VerifierState() {
 // # BLOCKING POOLS #
 // ##################
 
+/**
+ * While using resources such as database connections, sockets, etc.,
+ * it is typical to reuse them; that requires a fast and handy mechanism.
+ * This [BlockingPool] abstraction maintains a set of elements that can be put
+ * into the pool for further reuse or be retrieved to process the current operation.
+ * When [retrieve] comes to an empty pool, it blocks, and the following [put] operation
+ * resumes it; all the waiting requests are processed in the first-in-first-out (FIFO) order.
+ *
+ * In our tests we consider two pool implementations: the [queue-based][BlockingQueuePool]
+ * and the [stack-based][BlockingStackPool]. Intuitively, the queue-based implementation is
+ * faster since it is built on arrays and uses `Fetch-And-Add`-s on the contended path,
+ * while the stack-based pool retrieves the last inserted, thus the "hottest", elements.
+ *
+ * Please note that both these implementations are not atomic and can retrieve elements
+ * out-of-order under some races. However, since pools by themselves do not guarantee
+ * that the stored elements are ordered (the one may consider them as bags),
+ * these queue- and stack-based versions should be considered as ones with the specific heuristics.
+ */
 interface BlockingPool<T: Any> {
+    /**
+     * Either resumes the first waiting [retrieve] operation
+     * and passes the [element] to it, or simply put the
+     * [element] into the pool.
+     */
     fun put(element: T)
+
+    /**
+     * Retrieves one of the elements from the pool
+     * (the order is not specified), or suspends if it is
+     * empty -- the following [put] operations resume
+     * waiting [retrieve]-s in the first-in-first-out order.
+     */
     suspend fun retrieve(): T
-}
+} // TODO: smart cancellation is possible!
 
 internal class BlockingQueuePool<T: Any> : SegmentQueueSynchronizer<T>(), BlockingPool<T> {
+    override val resumeMode: ResumeMode get() = ASYNC
+
     private val balance = atomic(0L) // #put  - #retrieve
 
     private val elements = atomicArrayOfNulls<Any?>(100) // This is an infinite array by design :)
-    private val adds = atomic(0)
-    private val polls = atomic(0)
+    private val insertIdx = atomic(0) // the next slot for insertion
+    private val retrieveIdx = atomic(0) // the next slot for retrieval
 
     override fun put(element: T) {
         while (true) {
+            // Increment the number of `put`
+            // operations in the balance.
             val b = balance.getAndIncrement()
+            // Is there a waiting `retrieve`?
             if (b < 0) {
+                // Try to resume the first waiter,
+                // can fail if it is already cancelled.
                 if (tryResume(element)) return
             } else {
+                // Try to insert the element into the
+                // array, can fail if the slot is broken.
                 if (tryInsert(element)) return
             }
         }
     }
 
+    /**
+     * Tries to insert the [element] into the next
+     * [elements] array slot. Returns `true` if
+     * succeeds, or `fail` if the slot is [broken][BROKEN].
+     */
     private fun tryInsert(element: T): Boolean {
-        val i = adds.getAndIncrement()
+        val i = insertIdx.getAndIncrement()
         return elements[i].compareAndSet(null, element)
     }
 
     override suspend fun retrieve(): T {
         while (true) {
+            // Increment the number of `retrieve`
+            // operations in the balance.
             val b = balance.getAndDecrement()
+            // Is there an element in the pool?
             if (b > 0) {
+                // Try to retrieve the first element,
+                // can fail if the first [elements] slot
+                // is empty due to a race.
                 val x = tryRetrieve()
                 if (x != null) return x
             } else {
-                val x = suspendAtomicCancellableCoroutine<T?> { cont ->
-                    if (!suspend(cont)) cont.resume(null)
+                // The pool is empty, suspend
+                return suspendAtomicCancellableCoroutine { cont ->
+                    suspend(cont)
                 }
-                if (x != null) return x
             }
-
         }
     }
 
+    /**
+     * Tries to retrieve the first element from
+     * the [elements] array. Return the element if
+     * succeeds, or `null` if the first slot is empty
+     * due to a race -- it marks the slot as [broken][BROKEN]
+     * in this case, so that the corresponding [tryInsert]
+     * invocation fails.
+     */
     private fun tryRetrieve(): T? {
-        val i = polls.getAndIncrement()
+        val i = retrieveIdx.getAndIncrement()
         return elements[i].getAndSet(BROKEN) as T?
     }
 
@@ -372,6 +431,9 @@ internal class BlockingQueuePool<T: Any> : SegmentQueueSynchronizer<T>(), Blocki
 }
 
 internal class BlockingStackPool<T: Any> : SegmentQueueSynchronizer<T>(), BlockingPool<T> {
+    override val resumeMode: ResumeMode get() = ASYNC
+    override val cancellationMode: CancellationMode get() = SMART
+
     private val head = atomic<StackNode<T>?>(null)
     private val balance = atomic(0) // #put - #retrieve
 
@@ -379,7 +441,8 @@ internal class BlockingStackPool<T: Any> : SegmentQueueSynchronizer<T>(), Blocki
         while (true) {
             val b = balance.getAndIncrement()
             if (b < 0) {
-                if (tryResume(element)) return
+                resume(element)
+                return
             } else {
                 if (tryInsert(element)) return
             }
@@ -405,10 +468,9 @@ internal class BlockingStackPool<T: Any> : SegmentQueueSynchronizer<T>(), Blocki
                 val x = tryRetrieve()
                 if (x != null) return x
             } else {
-                val x = suspendAtomicCancellableCoroutine<T?> { cont ->
-                    if (!suspend(cont)) cont.resume(null)
+                return suspendAtomicCancellableCoroutine { cont ->
+                    suspend(cont)
                 }
-                if (x != null) return x
             }
         }
     }
@@ -423,6 +485,17 @@ internal class BlockingStackPool<T: Any> : SegmentQueueSynchronizer<T>(), Blocki
                 if (head.compareAndSet(h, h.next)) return h.element
             }
         }
+    }
+
+    override fun onCancellation(): Boolean {
+        balance.loop { cur ->
+            if (cur >= 0) return true
+            if (cur < 0 && balance.compareAndSet(cur, cur + 1)) return false
+        }
+    }
+
+    override fun onIgnoredValue(value: T) {
+        put(value)
     }
 
     class StackNode<T>(val element: T?, val next: StackNode<T>?)
@@ -477,6 +550,10 @@ class BlockingPoolUnitSequential : VerifierState() {
 // # UTILITIES #
 // #############
 
+/**
+ * Tries to resume this continuation atomically,
+ * returns `true` if succeeds and `false` otherwise.
+ */
 private fun <T> CancellableContinuation<T>.tryResume0(value: T): Boolean {
     val token = tryResume(value) ?: return false
     completeResume(token)

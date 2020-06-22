@@ -167,7 +167,10 @@ internal abstract class SegmentQueueSynchronizer<T> {
                 cellState === CANCELLED -> {
                     return false
                 } // the acquire was already cancelled
-                cellState === IGNORE -> return true
+                cellState === IGNORE -> {
+                    onIgnoredValue(value)
+                    return true
+                }
                 cellState is CancellableContinuation<*> -> {
                     val success = (cellState as CancellableContinuation<T>).tryResume0(value)
                     if (success) {
@@ -178,6 +181,7 @@ internal abstract class SegmentQueueSynchronizer<T> {
                     if (!segment.cas(i, cellState, CANCELLING)) continue@modify_cell
                     val ignore = onCancellation()
                     if (ignore) {
+                        onIgnoredValue(value)
                         segment.set(i, IGNORE)
                         return true
                     } else {
@@ -203,6 +207,8 @@ internal abstract class SegmentQueueSynchronizer<T> {
      * TODO
      */
     open fun onCancellation() : Boolean = false
+
+    open fun onIgnoredValue(value: T) {}
 
     /**
      * These modes define the strategy that [tryResume] and [resume] should
@@ -241,6 +247,9 @@ internal abstract class SegmentQueueSynchronizer<T> {
             }
             val ignore = onCancellation()
             if (ignore) {
+                if (segment.cas(index, CANCELLING, IGNORE)) return
+                val value = segment.get(index) as T
+                onIgnoredValue(value)
                 segment.set(index, IGNORE)
             } else {
                 if (segment.cas(index, CANCELLING, CANCELLED)) return
