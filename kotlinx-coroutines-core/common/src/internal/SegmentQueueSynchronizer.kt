@@ -6,8 +6,8 @@ package kotlinx.coroutines.internal
 
 import kotlinx.atomicfu.*
 import kotlinx.coroutines.*
-import kotlinx.coroutines.flow.internal.DONE
-import kotlinx.coroutines.internal.SegmentQueueSynchronizer.Mode.*
+import kotlinx.coroutines.internal.SegmentQueueSynchronizer.CancellationMode.*
+import kotlinx.coroutines.internal.SegmentQueueSynchronizer.ResumeMode.*
 import kotlinx.coroutines.sync.*
 import kotlin.coroutines.*
 import kotlin.native.concurrent.*
@@ -75,7 +75,7 @@ import kotlin.native.concurrent.*
  *  finds the required segment starting from the initially read one.
  */
 @InternalCoroutinesApi
-internal open class SegmentQueueSynchronizer<T>(val mode: Mode) {
+internal abstract class SegmentQueueSynchronizer<T> {
     private val head: AtomicRef<SQSSegment>
     private val deqIdx = atomic(0L)
     private val tail: AtomicRef<SQSSegment>
@@ -86,6 +86,9 @@ internal open class SegmentQueueSynchronizer<T>(val mode: Mode) {
         head = atomic(s)
         tail = atomic(s)
     }
+
+    protected open val resumeMode: ResumeMode get() = SYNC
+    protected open val cancellationMode: CancellationMode get() = SIMPLE
 
     /**
      * TODO
@@ -101,7 +104,7 @@ internal open class SegmentQueueSynchronizer<T>(val mode: Mode) {
         // the regular (fast) path -- if the cell is empty, try to install continuation
         if (segment.cas(i, null, cont)) { // try to install the continuation
             if (cont is CancellableContinuation<*>) {
-                cont.invokeOnCancellation(SQSCancellationHandler(this, segment, i).asHandler)
+                cont.invokeOnCancellation(SQSCancellationHandler(segment, i).asHandler)
             }
             return true
         }
@@ -149,7 +152,7 @@ internal open class SegmentQueueSynchronizer<T>(val mode: Mode) {
                 cellState === null -> {
                     if (!segment.cas(i, null, value)) continue@modify_cell
                     // Return immediately in the async mode
-                    if (mode.async) return true
+                    if (resumeMode == ASYNC) return true
                     // Acquire has not touched this cell yet, wait until it comes for a bounded time
                     // The cell state can only transition from PERMIT to TAKEN by addAcquireToQueue
                     repeat(MAX_SPIN_CYCLES) {
@@ -171,7 +174,7 @@ internal open class SegmentQueueSynchronizer<T>(val mode: Mode) {
                         segment.set(i, DONE)
                         return true
                     }
-                    if (mode != ASYNC_SMART) return false
+                    if (cancellationMode == SIMPLE) return false
                     if (!segment.cas(i, cellState, CANCELLING)) continue@modify_cell
                     val ignore = onCancellation()
                     if (ignore) {
@@ -215,10 +218,40 @@ internal open class SegmentQueueSynchronizer<T>(val mode: Mode) {
      * as [broken][BROKEN] and failing if it is not, so that the corresponding
      * [suspend] invocation finds the cell [broken][BROKEN] and fails as well.
      */
-    internal enum class Mode(val async: Boolean) {
-        SYNC(false),
-        ASYNC(true),
-        ASYNC_SMART(true)
+    internal enum class ResumeMode { SYNC, ASYNC }
+
+    /**
+     * TODO
+     */
+    internal enum class CancellationMode { SIMPLE, SMART }
+
+    private inner class SQSCancellationHandler(
+        private val segment: SQSSegment,
+        private val index: Int
+    ) : CancelHandler() {
+        override fun invoke(cause: Throwable?) {
+            if (cancellationMode == SIMPLE) {
+                segment.cancel(index)
+                return
+            }
+            val cellState = segment.get(index)
+            if (cellState === CANCELLING || cellState === CANCELLED || cellState === IGNORE) return
+            if (!segment.cas(index, cellState, CANCELLING)) {
+                return
+            }
+            val ignore = onCancellation()
+            if (ignore) {
+                segment.set(index, IGNORE)
+            } else {
+                if (segment.cas(index, CANCELLING, CANCELLED)) return
+                val value = segment.get(index) as T
+                segment.set(index, CANCELLED)
+                segment.onSlotCleaned()
+                resume(value)
+            }
+        }
+
+        override fun toString() = "SQSCancellationHandler[$segment, $index]"
     }
 }
 
@@ -226,36 +259,6 @@ private fun <T> CancellableContinuation<T>.tryResume0(value: T): Boolean {
     val token = tryResume(value) ?: return false
     completeResume(token)
     return true
-}
-
-private class SQSCancellationHandler<T>(
-    private val sqs: SegmentQueueSynchronizer<T>,
-    private val segment: SQSSegment,
-    private val index: Int
-) : CancelHandler() {
-    override fun invoke(cause: Throwable?) {
-        if (sqs.mode != ASYNC_SMART) {
-            segment.cancel(index)
-            return
-        }
-        val cellState = segment.get(index)
-        if (cellState === CANCELLING || cellState === CANCELLED || cellState === IGNORE) return
-        if (!segment.cas(index, cellState, CANCELLING)) {
-            return
-        }
-        val ignore = sqs.onCancellation()
-        if (ignore) {
-            segment.set(index, IGNORE)
-        } else {
-            if (segment.cas(index, CANCELLING, CANCELLED)) return
-            val value = segment.get(index) as T
-            segment.set(index, CANCELLED)
-            segment.onSlotCleaned()
-            sqs.resume(value)
-        }
-    }
-
-    override fun toString() = "SQSCancellationHandler[$segment, $index]"
 }
 
 private fun createSegment(id: Long, prev: SQSSegment?) = SQSSegment(id, prev, 0)
@@ -304,3 +307,5 @@ private val CANCELLING = Symbol("CANCELLING")
 private val CANCELLED = Symbol("CANCELLED")
 @SharedImmutable
 private val IGNORE = Symbol("IGNORE")
+@SharedImmutable
+private val DONE = Symbol("DONE")

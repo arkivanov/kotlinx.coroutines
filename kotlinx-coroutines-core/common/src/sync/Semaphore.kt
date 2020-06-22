@@ -7,7 +7,6 @@ package kotlinx.coroutines.sync
 import kotlinx.atomicfu.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.internal.*
-import kotlinx.coroutines.internal.SegmentQueueSynchronizer.Mode.*
 import kotlin.contracts.*
 import kotlin.coroutines.*
 import kotlin.math.*
@@ -89,7 +88,7 @@ public suspend inline fun <T> Semaphore.withPermit(action: () -> T): T {
     }
 }
 
-private class SemaphoreImpl(private val permits: Int, acquiredPermits: Int) : SegmentQueueSynchronizer<Unit>(SYNC), Semaphore {
+private class SemaphoreImpl(private val permits: Int, acquiredPermits: Int) : SegmentQueueSynchronizer<Unit>(), Semaphore {
     init {
         require(permits > 0) { "Semaphore should have at least 1 permit, but had $permits" }
         require(acquiredPermits in 0..permits) { "The number of acquired permits should be in 0..$permits" }

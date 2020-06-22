@@ -8,7 +8,6 @@ package kotlinx.coroutines.linearizability
 import kotlinx.atomicfu.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.internal.*
-import kotlinx.coroutines.internal.SegmentQueueSynchronizer.Mode.*
 import kotlinx.coroutines.sync.*
 import org.jetbrains.kotlinx.lincheck.*
 import org.jetbrains.kotlinx.lincheck.annotations.Operation
@@ -37,12 +36,14 @@ import kotlin.reflect.jvm.*
 // without contention (independently on the number of cancelled requests)
 // but requires some non-trivial tricks and much more complicated analysis.
 
-internal abstract class AsyncSemaphoreBase(permits: Int, mode: Mode) : SegmentQueueSynchronizer<Unit>(mode), Semaphore {
+internal abstract class AsyncSemaphoreBase(permits: Int) : SegmentQueueSynchronizer<Unit>(), Semaphore {
+    override val resumeMode get() = ResumeMode.ASYNC
+
     private val _availablePermits = atomic(permits)
     override val availablePermits get() = error("Not implemented")
 
-    fun incPermits() = _availablePermits.getAndIncrement()
-    fun decPermits() = _availablePermits.getAndDecrement()
+    protected fun incPermits() = _availablePermits.getAndIncrement()
+    protected fun decPermits() = _availablePermits.getAndDecrement()
 
     override suspend fun acquire() {
         val p = decPermits()
@@ -57,7 +58,7 @@ internal abstract class AsyncSemaphoreBase(permits: Int, mode: Mode) : SegmentQu
     override fun tryAcquire() =  error("Not supported in the ASYNC version")
 }
 
-internal class AsyncSemaphore(permits: Int) : AsyncSemaphoreBase(permits, ASYNC) {
+internal class AsyncSemaphore(permits: Int) : AsyncSemaphoreBase(permits) {
     override fun release() {
         while (true) {
             val p = incPermits()
@@ -67,7 +68,9 @@ internal class AsyncSemaphore(permits: Int) : AsyncSemaphoreBase(permits, ASYNC)
     }
 }
 
-internal class AsyncSemaphoreSmart(permits: Int) : AsyncSemaphoreBase(permits, ASYNC_SMART) {
+internal class AsyncSemaphoreSmart(permits: Int) : AsyncSemaphoreBase(permits) {
+    override val cancellationMode: CancellationMode get() = CancellationMode.SMART
+
     override fun release() {
         val p = incPermits()
         if (p >= 0) return // no waiters
@@ -134,8 +137,10 @@ class AsyncSemaphoreSmart2LCStressTest : AsyncSemaphoreLCStressTestBase(AsyncSem
 // # COUNT-DOWN-LATCH SYNCHRONIZATION #
 // ####################################
 
-// TODO smart version?
-internal class CountDownLatch(count: Int) : SegmentQueueSynchronizer<Unit>(ASYNC_SMART) {
+internal class CountDownLatch(count: Int) : SegmentQueueSynchronizer<Unit>() {
+    override val resumeMode: ResumeMode get() = ResumeMode.ASYNC
+    override val cancellationMode: CancellationMode get() = CancellationMode.SMART
+
     private val count = atomic(count)
     private val waiters = atomic(0)
 
@@ -224,7 +229,10 @@ open class CountDownLatchSequential(initialCount: Int) : VerifierState() {
 // # BARRIER SYNCHRONIZATION #
 // ###########################
 
-internal class Barrier(private val parties: Int) : SegmentQueueSynchronizer<Unit>(ASYNC_SMART) {
+internal class Barrier(private val parties: Int) : SegmentQueueSynchronizer<Unit>() {
+    override val resumeMode: ResumeMode get() = ResumeMode.ASYNC
+    override val cancellationMode: CancellationMode get() = CancellationMode.SMART
+
     private val arrived = atomic(0L)
 
     suspend fun arrive(): Boolean {
@@ -313,7 +321,7 @@ interface BlockingPool<T: Any> {
     suspend fun retrieve(): T
 }
 
-internal class BlockingQueuePool<T: Any> : SegmentQueueSynchronizer<T>(SYNC), BlockingPool<T> {
+internal class BlockingQueuePool<T: Any> : SegmentQueueSynchronizer<T>(), BlockingPool<T> {
     private val balance = atomic(0L) // #put  - #retrieve
 
     private val elements = atomicArrayOfNulls<Any?>(100) // This is an infinite array by design :)
@@ -363,7 +371,7 @@ internal class BlockingQueuePool<T: Any> : SegmentQueueSynchronizer<T>(SYNC), Bl
     }
 }
 
-internal class BlockingStackPool<T: Any> : SegmentQueueSynchronizer<T>(SYNC), BlockingPool<T> {
+internal class BlockingStackPool<T: Any> : SegmentQueueSynchronizer<T>(), BlockingPool<T> {
     private val head = atomic<StackNode<T>?>(null)
     private val balance = atomic(0) // #put - #retrieve
 
