@@ -506,8 +506,9 @@ internal class BlockingStackPool<T: Any> : SegmentQueueSynchronizer<T>(), Blocki
         while (true) {
             val h = head.value
             if (h == null || h.element == null) {
-                val suspendedNode = StackNode(null, h)
-                if (head.compareAndSet(h, suspendedNode)) return null
+                continue
+//                val suspendedNode = StackNode(null, h)
+//                if (head.compareAndSet(h, suspendedNode)) return null
             } else {
                 if (head.compareAndSet(h, h.next)) return h.element
             }
