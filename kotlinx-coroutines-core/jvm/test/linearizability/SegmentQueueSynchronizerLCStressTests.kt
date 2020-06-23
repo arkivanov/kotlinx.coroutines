@@ -85,6 +85,43 @@ internal class AsyncSemaphoreSmart(permits: Int) : AsyncSemaphoreBase(permits) {
     }
 }
 
+internal class SyncSemaphoreSmart(permits: Int) : SegmentQueueSynchronizer<Boolean>(), Semaphore {
+    override val cancellationMode get() = SMART
+
+    private val _availablePermits = atomic(permits)
+    override val availablePermits get() = error("Not implemented")
+
+    protected fun incPermits() = _availablePermits.getAndIncrement()
+    protected fun decPermits() = _availablePermits.getAndDecrement()
+
+    override suspend fun acquire() {
+        while (true) {
+            val p = decPermits()
+            // Is the permit acquired?
+            if (p > 0) return
+            // Suspend otherwise
+            val acquired = suspendAtomicCancellableCoroutine<Boolean> { cont ->
+                if (!suspend(cont)) cont.resume(false)
+            }
+            if (acquired) return
+        }
+    }
+
+    override fun tryAcquire() = error("Not supported in the ASYNC version")
+
+    override fun release() {
+        while (true) {
+            val p = incPermits()
+            if (p >= 0) return // no waiters
+            if (tryResume(true)) return // can fail due to cancellation
+        }
+    }
+
+    override fun onCancellation(): Boolean {
+        return super.onCancellation()
+    }
+}
+
 abstract class AsyncSemaphoreLCStressTestBase(semaphore: Semaphore, seqSpec: KClass<*>)
     : SemaphoreLCStressTestBase(semaphore, seqSpec)
 {
@@ -95,17 +132,7 @@ abstract class AsyncSemaphoreLCStressTestBase(semaphore: Semaphore, seqSpec: KCl
     {
         override fun nextExecution() = ExecutionScenario(
             emptyList(),
-            listOf(
-                listOf(
-                    Actor(AsyncSemaphoreLCStressTestBase::acquire.javaMethod!!, emptyList(), emptyList())
-                ),
-                listOf(
-                    Actor(AsyncSemaphoreLCStressTestBase::acquire.javaMethod!!, emptyList(), emptyList()),
-                    Actor(AsyncSemaphoreLCStressTestBase::acquire.javaMethod!!, emptyList(), emptyList(), cancelOnSuspension = true),
-                    Actor(AsyncSemaphoreLCStressTestBase::release.javaMethod!!, emptyList(), emptyList())
-                )
-            ),
-//            generateParallelPart(testConfiguration.threads, testConfiguration.actorsPerThread),
+            generateParallelPart(testConfiguration.threads, testConfiguration.actorsPerThread),
             emptyList()
         )
 
@@ -490,7 +517,7 @@ internal class BlockingStackPool<T: Any> : SegmentQueueSynchronizer<T>(), Blocki
     override fun onCancellation(): Boolean {
         balance.loop { cur ->
             if (cur >= 0) return true
-            if (cur < 0 && balance.compareAndSet(cur, cur + 1)) return false
+            if (balance.compareAndSet(cur, cur + 1)) return false
         }
     }
 
