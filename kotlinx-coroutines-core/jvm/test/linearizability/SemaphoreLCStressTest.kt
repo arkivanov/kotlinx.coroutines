@@ -24,17 +24,14 @@ abstract class SemaphoreLCStressTestBase(semaphore: Semaphore, val seqSpec: KCla
     @Operation(handleExceptionsAsResult = [IllegalStateException::class])
     fun release() = s.release()
 
-    open fun Options<*, *>.customize(): Options<*, *> = this
-
     @Test
     fun test() = LCStressOptionsDefault()
         .actorsBefore(0)
         .sequentialSpecification(seqSpec.java)
-        .customize()
         .check(this::class)
 }
 
-open class SemaphoreSequential(val permits: Int) : VerifierState() {
+open class SemaphoreSequential(val permits: Int, val boundMaxPermits: Boolean) : VerifierState() {
     private var availablePermits = permits
     private val waiters = ArrayList<CancellableContinuation<Unit>>()
 
@@ -54,7 +51,7 @@ open class SemaphoreSequential(val permits: Int) : VerifierState() {
 
     fun release() {
         while (true) {
-            check(availablePermits < permits)
+            check(availablePermits < permits || !boundMaxPermits)
             availablePermits++
             if (availablePermits > 0) return
             val w = waiters.removeAt(0)
@@ -65,10 +62,10 @@ open class SemaphoreSequential(val permits: Int) : VerifierState() {
     override fun extractState() = availablePermits.coerceAtLeast(0)
 }
 
-class SemaphoreSequential1 : SemaphoreSequential(1)
+class SemaphoreSequential1 : SemaphoreSequential(1, true)
 class Semaphore1LCStressTest : SemaphoreLCStressTestBase(Semaphore(1), SemaphoreSequential1::class)
 
-class SemaphoreSequential2 : SemaphoreSequential(2)
+class SemaphoreSequential2 : SemaphoreSequential(2, true)
 class Semaphore2LCStressTest : SemaphoreLCStressTestBase(Semaphore(2), SemaphoreSequential2::class)
 
 private fun <T> CancellableContinuation<T>.tryResume0(value: T): Boolean {

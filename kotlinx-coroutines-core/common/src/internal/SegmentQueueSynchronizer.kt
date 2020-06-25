@@ -6,7 +6,6 @@ package kotlinx.coroutines.internal
 
 import kotlinx.atomicfu.*
 import kotlinx.coroutines.*
-import kotlinx.coroutines.internal.SegmentQueueSynchronizer.CancellationMode.*
 import kotlinx.coroutines.internal.SegmentQueueSynchronizer.ResumeMode.*
 import kotlinx.coroutines.sync.*
 import kotlin.coroutines.*
@@ -87,8 +86,18 @@ internal abstract class SegmentQueueSynchronizer<T> {
         tail = atomic(s)
     }
 
+    /**
+     * Specifies whether [resume] should work in
+     * [synchronous][SYNC] or [asynchronous][ASYNC] mode.
+     */
     protected open val resumeMode: ResumeMode get() = SYNC
-    protected open val cancellationMode: CancellationMode get() = SIMPLE
+
+    /**
+     * Specifies whether [resume] should skip cancelled waiters (`true`)
+     * or fail in this case (`false`). By default, [resume] fails if
+     * comes to a cancelled waiter.
+     */
+    protected open val skipCancelled: Boolean get() = false
 
     /**
      * TODO
@@ -120,21 +129,22 @@ internal abstract class SegmentQueueSynchronizer<T> {
     }
 
     /**
-     * TODO
-     */
-    fun tryResume(value: T): Boolean = tryResumeImpl(value, adjustDeqIdx = false)
-
-    /**
      * Essentially, this is a short-cut for `while (!tryResume(..)) {}`, but
      * works in O(1) without contention independently on how many
      * [suspended][suspend] continuations has been cancelled.
      */
-    fun resume(value: T) {
-        while (!tryResumeImpl(value, adjustDeqIdx = true)) { /* try again */ }
+    fun resume(value: T): Boolean {
+        while (true) {
+            when (tryResumeImpl(value, adjustDeqIdx = skipCancelled)) {
+                TRY_RESUME_SUCCESS -> return true
+                TRY_RESUME_FAIL_CANCELLED -> if (!skipCancelled) return false
+                TRY_RESUME_FAIL_BROKEN -> return false
+            }
+        }
     }
 
     @Suppress("UNCHECKED_CAST")
-    private fun tryResumeImpl(value: T, adjustDeqIdx: Boolean): Boolean {
+    private fun tryResumeImpl(value: T, adjustDeqIdx: Boolean): Int {
         val curHead = this.head.value
         val deqIdx = deqIdx.getAndIncrement()
         val id = deqIdx / SEGMENT_SIZE
@@ -143,7 +153,7 @@ internal abstract class SegmentQueueSynchronizer<T> {
         segment.cleanPrev()
         if (segment.id > id) {
             if (adjustDeqIdx) adjustDeqIdx(segment.id * SEGMENT_SIZE)
-            return false
+            return TRY_RESUME_FAIL_CANCELLED
         }
         val i = (deqIdx % SEGMENT_SIZE).toInt()
         modify_cell@while (true) { // modify the cell state
@@ -152,47 +162,38 @@ internal abstract class SegmentQueueSynchronizer<T> {
                 cellState === null -> {
                     if (!segment.cas(i, null, value)) continue@modify_cell
                     // Return immediately in the async mode
-                    if (resumeMode == ASYNC) return true
+                    if (resumeMode == ASYNC) return TRY_RESUME_SUCCESS
                     // Acquire has not touched this cell yet, wait until it comes for a bounded time
                     // The cell state can only transition from PERMIT to TAKEN by addAcquireToQueue
                     repeat(MAX_SPIN_CYCLES) {
-                        if (segment.get(i) === TAKEN) return true
+                        if (segment.get(i) === TAKEN) return TRY_RESUME_SUCCESS
                     }
                     // Try to break the slot in order not to wait
-                    return !segment.cas(i, value, BROKEN)
-                }
-                cellState === CANCELLING -> {
-                    if (segment.cas(i, CANCELLING, value)) return true
+                    return if (segment.cas(i, value, BROKEN)) TRY_RESUME_FAIL_BROKEN else TRY_RESUME_SUCCESS
                 }
                 cellState === CANCELLED -> {
-                    return false
+                    return TRY_RESUME_FAIL_CANCELLED
                 } // the acquire was already cancelled
                 cellState === IGNORE -> {
                     onIgnoredValue(value)
-                    return true
+                    return TRY_RESUME_SUCCESS
                 }
                 cellState is CancellableContinuation<*> -> {
                     val success = (cellState as CancellableContinuation<T>).tryResume0(value)
                     if (success) {
                         segment.set(i, DONE)
-                        return true
-                    }
-                    if (cancellationMode == SIMPLE) return false
-                    if (!segment.cas(i, cellState, CANCELLING)) continue@modify_cell
-                    val ignore = onCancellation()
-                    if (ignore) {
-                        onIgnoredValue(value)
-                        segment.set(i, IGNORE)
-                        return true
+                        return TRY_RESUME_SUCCESS
                     } else {
-                        segment.set(i, CANCELLED)
-                        return false
+                        if (!skipCancelled) return TRY_RESUME_FAIL_CANCELLED
+                        // Let the cancellation handler decide what to do with the element :)
+                        val valueToStore: Any? = if (value is Continuation<*>) WrappedContinuation(value) else value
+                        if (segment.cas(i, cellState, valueToStore)) return TRY_RESUME_SUCCESS
                     }
                 }
                 else -> {
                     (cellState as Continuation<T>).resume(value)
                     segment.set(i, DONE)
-                    return true
+                    return TRY_RESUME_SUCCESS
                 }
             }
         }
@@ -210,6 +211,8 @@ internal abstract class SegmentQueueSynchronizer<T> {
 
     open fun onIgnoredValue(value: T) {}
 
+    open fun onResumeFailure(value: T) {}
+
     /**
      * These modes define the strategy that [tryResume] and [resume] should
      * use when they come to the cell before [suspend] and find it empty.
@@ -226,37 +229,19 @@ internal abstract class SegmentQueueSynchronizer<T> {
      */
     internal enum class ResumeMode { SYNC, ASYNC }
 
-    /**
-     * TODO
-     */
-    internal enum class CancellationMode { SIMPLE, SMART }
-
     private inner class SQSCancellationHandler(
         private val segment: SQSSegment,
         private val index: Int
     ) : CancelHandler() {
         override fun invoke(cause: Throwable?) {
-            if (cancellationMode == SIMPLE) {
-                segment.cancel(index)
-                return
-            }
-            val cellState = segment.get(index)
-            if (cellState === CANCELLING || cellState === CANCELLED || cellState === IGNORE) return
-            if (!segment.cas(index, cellState, CANCELLING)) {
-                return
-            }
             val ignore = onCancellation()
             if (ignore) {
-                if (segment.cas(index, CANCELLING, IGNORE)) return
-                val value = segment.get(index) as T
-                onIgnoredValue(value)
-                segment.set(index, IGNORE)
+                val value = segment.markIgnored(index) ?: return
+                onIgnoredValue(value as T)
             } else {
-                if (segment.cas(index, CANCELLING, CANCELLED)) return
-                val value = segment.get(index) as T
-                segment.set(index, CANCELLED)
-                segment.onSlotCleaned()
-                resume(value)
+                val value = segment.markCancelled(index) ?: return
+                if (resume(value as T)) return
+                onResumeFailure(value)
             }
         }
 
@@ -273,34 +258,45 @@ private fun <T> CancellableContinuation<T>.tryResume0(value: T): Boolean {
 private fun createSegment(id: Long, prev: SQSSegment?) = SQSSegment(id, prev, 0)
 
 private class SQSSegment(id: Long, prev: SQSSegment?, pointers: Int) : Segment<SQSSegment>(id, prev, pointers) {
-    val acquirers = atomicArrayOfNulls<Any?>(SEGMENT_SIZE)
+    val waiters = atomicArrayOfNulls<Any?>(SEGMENT_SIZE)
     override val maxSlots: Int get() = SEGMENT_SIZE
 
     @Suppress("NOTHING_TO_INLINE")
-    inline fun get(index: Int): Any? = acquirers[index].value
+    inline fun get(index: Int): Any? = waiters[index].value
 
     @Suppress("NOTHING_TO_INLINE")
     inline fun set(index: Int, value: Any?) {
-        acquirers[index].value = value
+        waiters[index].value = value
     }
 
     @Suppress("NOTHING_TO_INLINE")
-    inline fun cas(index: Int, expected: Any?, value: Any?): Boolean = acquirers[index].compareAndSet(expected, value)
+    inline fun cas(index: Int, expected: Any?, value: Any?): Boolean = waiters[index].compareAndSet(expected, value)
+
+    @Suppress("NOTHING_TO_INLINE")
+    inline fun getAndSet(index: Int, value: Any?): Any? = waiters[index].getAndSet(value)
 
     // Cleans the acquirer slot located by the specified index
     // and removes this segment physically if all slots are cleaned.
-    fun cancel(index: Int): Boolean {
-        // Clean the slot
-        val cur = get(index)
-        if (cur === CANCELLED) return false
-        if (!cas(index, cur, CANCELLED)) return false
-        // Remove this segment if needed
-        onSlotCleaned()
-        return true
+    fun markCancelled(index: Int): Any? = mark(index, CANCELLED).also { res ->
+        if (res == null) onSlotCleaned()
     }
+
+    fun markIgnored(index: Int): Any? = mark(index, IGNORE)
+
+    private fun mark(index: Int, marker: Any?): Any? =
+        when (val old = getAndSet(index, marker)) {
+            is Continuation<*> -> {
+                assert { if (old is CancellableContinuation<*>) old.isCancelled else true }
+                null
+            }
+            is WrappedContinuation -> old.cont
+            else -> old
+        }
 
     override fun toString() = "SQSSegment[id=$id, hashCode=${hashCode()}]"
 }
+
+private class WrappedContinuation(val cont: Continuation<*>)
 
 @SharedImmutable
 private val SEGMENT_SIZE = systemProp("kotlinx.coroutines.sqs.segmentSize", 16)
@@ -311,10 +307,12 @@ private val TAKEN = Symbol("TAKEN")
 @SharedImmutable
 private val BROKEN = Symbol("BROKEN")
 @SharedImmutable
-private val CANCELLING = Symbol("CANCELLING")
-@SharedImmutable
 private val CANCELLED = Symbol("CANCELLED")
 @SharedImmutable
 private val IGNORE = Symbol("IGNORE")
 @SharedImmutable
 private val DONE = Symbol("DONE")
+
+private const val TRY_RESUME_SUCCESS = 0
+private const val TRY_RESUME_FAIL_CANCELLED = 1
+private const val TRY_RESUME_FAIL_BROKEN = 2

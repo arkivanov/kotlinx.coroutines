@@ -138,7 +138,7 @@ private class SemaphoreImpl(private val permits: Int, acquiredPermits: Int) : Se
                 cur + 1
             }
             if (p >= 0) return
-            if (tryResume(Unit)) return
+            if (resume(Unit)) return
         }
     }
 }

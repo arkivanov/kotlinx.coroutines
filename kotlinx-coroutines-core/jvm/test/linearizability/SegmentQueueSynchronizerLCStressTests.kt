@@ -8,18 +8,13 @@ package kotlinx.coroutines.linearizability
 import kotlinx.atomicfu.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.internal.*
-import kotlinx.coroutines.internal.SegmentQueueSynchronizer.CancellationMode.*
 import kotlinx.coroutines.internal.SegmentQueueSynchronizer.ResumeMode.*
 import kotlinx.coroutines.sync.*
-import org.jetbrains.kotlinx.lincheck.*
 import org.jetbrains.kotlinx.lincheck.annotations.Operation
-import org.jetbrains.kotlinx.lincheck.execution.*
 import org.jetbrains.kotlinx.lincheck.verifier.*
 import org.junit.*
 import kotlin.coroutines.*
-import kotlin.random.*
 import kotlin.reflect.*
-import kotlin.reflect.jvm.*
 
 // This test suit serves two purposes. First of all, it tests the `SegmentQueueSynchronizer`
 // implementation under different use-cases and workloads. At the same time, this test suite
@@ -65,13 +60,13 @@ internal class AsyncSemaphore(permits: Int) : AsyncSemaphoreBase(permits) {
         while (true) {
             val p = incPermits()
             if (p >= 0) return // no waiters
-            if (tryResume(Unit)) return // can fail due to cancellation
+            if (resume(Unit)) return // can fail due to cancellation
         }
     }
 }
 
 internal class AsyncSemaphoreSmart(permits: Int) : AsyncSemaphoreBase(permits) {
-    override val cancellationMode: CancellationMode get() = SMART
+    override val skipCancelled: Boolean get() = true
 
     override fun release() {
         val p = incPermits()
@@ -86,7 +81,8 @@ internal class AsyncSemaphoreSmart(permits: Int) : AsyncSemaphoreBase(permits) {
 }
 
 internal class SyncSemaphoreSmart(permits: Int) : SegmentQueueSynchronizer<Boolean>(), Semaphore {
-    override val cancellationMode get() = SMART
+    override val resumeMode: ResumeMode get() = SYNC
+    override val skipCancelled: Boolean get() = true
 
     private val _availablePermits = atomic(permits)
     override val availablePermits get() = error("Not implemented")
@@ -107,80 +103,73 @@ internal class SyncSemaphoreSmart(permits: Int) : SegmentQueueSynchronizer<Boole
         }
     }
 
-    override fun tryAcquire() = error("Not supported in the ASYNC version")
+    override fun tryAcquire(): Boolean = _availablePermits.loop { cur ->
+        if (cur <= 0) return false
+        if (_availablePermits.compareAndSet(cur, cur -1)) return true
+    }
 
     override fun release() {
         while (true) {
             val p = incPermits()
             if (p >= 0) return // no waiters
-            if (tryResume(true)) return // can fail due to cancellation
+            if (resume(true)) return // can fail due to cancellation
         }
     }
 
     override fun onCancellation(): Boolean {
-        return super.onCancellation()
+        val p = incPermits()
+        return p >= 0
+    }
+
+    override fun onResumeFailure(value: Boolean) {
+        release()
     }
 }
 
-abstract class AsyncSemaphoreLCStressTestBase(semaphore: Semaphore, seqSpec: KClass<*>)
-    : SemaphoreLCStressTestBase(semaphore, seqSpec)
-{
-    override fun Options<*, *>.customize() = this.executionGenerator(CustomSemaphoreScenarioGenerator::class.java)
+abstract class AsyncSemaphoreLCStressTestBase(semaphore: Semaphore, val seqSpec: KClass<*>) {
+    private val s = semaphore
 
-    class CustomSemaphoreScenarioGenerator(testConfiguration: CTestConfiguration, testStructure: CTestStructure)
-        : ExecutionGenerator(testConfiguration, testStructure)
-    {
-        override fun nextExecution() = ExecutionScenario(
-            emptyList(),
-            generateParallelPart(testConfiguration.threads, testConfiguration.actorsPerThread),
-            emptyList()
-        )
+    @Operation
+    suspend fun acquire() = s.acquire()
 
-        private fun generateParallelPart(threads: Int, actorsPerThread: Int) = (1..threads).map {
-            val actors = ArrayList<Actor>()
-            var acquiredPermits = 0
-            repeat(actorsPerThread) {
-                actors += if (acquiredPermits == 0 || Random.nextBoolean()) {
-                    // acquire
-                    acquiredPermits++
-                    Actor(AsyncSemaphoreLCStressTestBase::acquire.javaMethod!!, emptyList(), emptyList(), Random.nextBoolean())
-                } else {
-                    // release
-                    acquiredPermits--
-                    Actor(AsyncSemaphoreLCStressTestBase::release.javaMethod!!, emptyList(), emptyList())
-                }
-            }
-            actors
-        }
-    }
+    @Operation
+    fun release() = s.release()
+
+    @Test
+    fun test() = LCStressOptionsDefault()
+        .actorsBefore(0)
+        .sequentialSpecification(seqSpec.java)
+        .check(this::class)
 }
 
-class AsyncSemaphore1LCStressTest : AsyncSemaphoreLCStressTestBase(AsyncSemaphore(1), SemaphoreSequential1::class)
-class AsyncSemaphore2LCStressTest : AsyncSemaphoreLCStressTestBase(AsyncSemaphore(2), SemaphoreSequential2::class)
+class SemaphoreUnboundedSequential1 : SemaphoreSequential(1, false)
+class SemaphoreUnboundedSequential2 : SemaphoreSequential(2, false)
 
-class AsyncSemaphoreSmart1LCStressTest : AsyncSemaphoreLCStressTestBase(AsyncSemaphoreSmart(1), SemaphoreSequential1::class)
-class AsyncSemaphoreSmart2LCStressTest : AsyncSemaphoreLCStressTestBase(AsyncSemaphoreSmart(2), SemaphoreSequential2::class)
+class AsyncSemaphore1LCStressTest : AsyncSemaphoreLCStressTestBase(AsyncSemaphore(1), SemaphoreUnboundedSequential1::class)
+class AsyncSemaphore2LCStressTest : AsyncSemaphoreLCStressTestBase(AsyncSemaphore(2), SemaphoreUnboundedSequential2::class)
+
+class AsyncSemaphoreSmart1LCStressTest : AsyncSemaphoreLCStressTestBase(AsyncSemaphoreSmart(1), SemaphoreUnboundedSequential1::class)
+class AsyncSemaphoreSmart2LCStressTest : AsyncSemaphoreLCStressTestBase(AsyncSemaphoreSmart(2), SemaphoreUnboundedSequential2::class)
+
+class SyncSemaphoreSmart1LCStressTest : SemaphoreLCStressTestBase(SyncSemaphoreSmart(1), SemaphoreUnboundedSequential1::class)
+class SyncSemaphoreSmart2LCStressTest : SemaphoreLCStressTestBase(SyncSemaphoreSmart(2), SemaphoreUnboundedSequential2::class)
 
 
 // ####################################
 // # COUNT-DOWN-LATCH SYNCHRONIZATION #
 // ####################################
 
-internal class CountDownLatch(count: Int) : SegmentQueueSynchronizer<Unit>() {
+internal open class CountDownLatch(count: Int) : SegmentQueueSynchronizer<Unit>() {
     override val resumeMode: ResumeMode get() = ASYNC
-    override val cancellationMode: CancellationMode get() = SMART
 
     private val count = atomic(count)
     private val waiters = atomic(0)
 
+    protected fun decWaiters() = waiters.decrementAndGet()
+
     fun countDown() {
         val r = count.decrementAndGet()
         if (r <= 0) releaseWaiters()
-    }
-
-    override fun onCancellation(): Boolean {
-        val w = waiters.decrementAndGet()
-        return (w and DONE_MARK) != 0
     }
 
     private fun releaseWaiters() {
@@ -202,12 +191,22 @@ internal class CountDownLatch(count: Int) : SegmentQueueSynchronizer<Unit>() {
     }
 
     fun remaining(): Int = count.value.coerceAtLeast(0)
+
+    protected companion object {
+        const val DONE_MARK = 1 shl 31
+    }
 }
-private const val DONE_MARK = 1 shl 31
 
-abstract class CountDownLatchLCStressTestBase(count: Int, val seqSpec: KClass<*>) {
-    private val cdl = CountDownLatch(count)
+internal class CountDownLatchSmart(count: Int) : CountDownLatch(count) {
+    override val skipCancelled: Boolean get() = true
 
+    override fun onCancellation(): Boolean {
+        val w = decWaiters()
+        return (w and DONE_MARK) != 0
+    }
+}
+
+internal abstract class CountDownLatchLCStressTestBase(val cdl: CountDownLatch, val seqSpec: KClass<*>) {
     @Operation
     fun countDown() = cdl.countDown()
 
@@ -226,9 +225,13 @@ abstract class CountDownLatchLCStressTestBase(count: Int, val seqSpec: KClass<*>
 }
 
 class CountDownLatchSequential1 : CountDownLatchSequential(1)
-class CountDownLatch1LCStressTest : CountDownLatchLCStressTestBase(1, CountDownLatchSequential1::class)
 class CountDownLatchSequential2 : CountDownLatchSequential(2)
-class CountDownLatch2LCStressTest : CountDownLatchLCStressTestBase(2, CountDownLatchSequential2::class)
+
+internal class CountDownLatch1LCStressTest : CountDownLatchLCStressTestBase(CountDownLatch(1), CountDownLatchSequential1::class)
+internal class CountDownLatch2LCStressTest : CountDownLatchLCStressTestBase(CountDownLatch(2), CountDownLatchSequential2::class)
+
+internal class CountDownLatchSmart1LCStressTest : CountDownLatchLCStressTestBase(CountDownLatchSmart(1), CountDownLatchSequential1::class)
+internal class CountDownLatchSmart2LCStressTest : CountDownLatchLCStressTestBase(CountDownLatchSmart(2), CountDownLatchSequential2::class)
 
 open class CountDownLatchSequential(initialCount: Int) : VerifierState() {
     private var count = initialCount
@@ -260,7 +263,7 @@ open class CountDownLatchSequential(initialCount: Int) : VerifierState() {
 
 internal class Barrier(private val parties: Int) : SegmentQueueSynchronizer<Unit>() {
     override val resumeMode: ResumeMode get() = ASYNC
-    override val cancellationMode: CancellationMode get() = SMART
+    override val skipCancelled: Boolean get() = true
 
     private val arrived = atomic(0L)
 
@@ -273,7 +276,7 @@ internal class Barrier(private val parties: Int) : SegmentQueueSynchronizer<Unit
             }
             a == parties.toLong() -> {
                 repeat(parties - 1) {
-                    tryResume(Unit)
+                    resume(Unit)
                 }
                 true
             }
@@ -398,7 +401,7 @@ internal class BlockingQueuePool<T: Any> : SegmentQueueSynchronizer<T>(), Blocki
             if (b < 0) {
                 // Try to resume the first waiter,
                 // can fail if it is already cancelled.
-                if (tryResume(element)) return
+                if (resume(element)) return
             } else {
                 // Try to insert the element into the
                 // array, can fail if the slot is broken.
@@ -459,74 +462,53 @@ internal class BlockingQueuePool<T: Any> : SegmentQueueSynchronizer<T>(), Blocki
 
 internal class BlockingStackPool<T: Any> : SegmentQueueSynchronizer<T>(), BlockingPool<T> {
     override val resumeMode: ResumeMode get() = ASYNC
-    override val cancellationMode: CancellationMode get() = SMART
+    override val skipCancelled: Boolean get() = true
 
     private val head = atomic<StackNode<T>?>(null)
-    private val balance = atomic(0) // #put - #retrieve
+    private val availableElements = atomic(0) // #put - #retrieve
 
-    override fun put(element: T) {
-        while (true) {
-            val b = balance.getAndIncrement()
-            if (b < 0) {
-                resume(element)
-                return
-            } else {
-                if (tryInsert(element)) return
-            }
+    override fun put(element: T) { // == release
+        val b = availableElements.getAndIncrement()
+        if (b >= 0) {
+            tryInsert(element)
+            return
+        }
+        resume(element)
+    }
+
+    private fun tryInsert(element: T) {
+        head.loop { h ->
+            val newHead = StackNode(element, h)
+            if (head.compareAndSet(h, newHead)) return
         }
     }
 
-    private fun tryInsert(element: T): Boolean {
-        while (true) {
-            val h = head.value
-            if (h != null && h.element == null) {
-                if (head.compareAndSet(h, h.next)) return false
-            } else {
-                val newHead = StackNode(element, h)
-                if (head.compareAndSet(h, newHead)) return true
-            }
+    override suspend fun retrieve(): T { // == acquire
+        val b = availableElements.getAndDecrement()
+        if (b > 0) return tryRetrieve()
+        return suspendAtomicCancellableCoroutine { cont ->
+            suspend(cont)
         }
     }
 
-    override suspend fun retrieve(): T {
-        while (true) {
-            val b = balance.getAndDecrement()
-            if (b > 0) {
-                val x = tryRetrieve()
-                if (x != null) return x
-            } else {
-                return suspendAtomicCancellableCoroutine { cont ->
-                    suspend(cont)
-                }
-            }
-        }
-    }
-
-    private fun tryRetrieve(): T? {
-        while (true) {
-            val h = head.value
-            if (h == null || h.element == null) {
-                continue
-//                val suspendedNode = StackNode(null, h)
-//                if (head.compareAndSet(h, suspendedNode)) return null
-            } else {
-                if (head.compareAndSet(h, h.next)) return h.element
-            }
+    private fun tryRetrieve(): T {
+        head.loop { h ->
+            if (h != null && head.compareAndSet(h, h.next))
+                return h.element
         }
     }
 
     override fun onCancellation(): Boolean {
-        balance.loop { cur ->
-            if (cur >= 0) return true
-            if (balance.compareAndSet(cur, cur + 1)) return false
-        }
+        val b = availableElements.getAndIncrement()
+        if (b >= 0) return true // return the element to the stack
+        return false // resume the next waiter
     }
 
     override fun onIgnoredValue(value: T) {
-        put(value)
+        tryInsert(value)
     }
 
-    class StackNode<T>(val element: T?, val next: StackNode<T>?)
+    class StackNode<T>(val element: T, val next: StackNode<T>?)
 }
 
 abstract class BlockingPoolLCStressTestBase(val p: BlockingPool<Unit>) {
