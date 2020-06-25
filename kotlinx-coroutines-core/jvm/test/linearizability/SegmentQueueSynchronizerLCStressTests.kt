@@ -9,6 +9,7 @@ import kotlinx.atomicfu.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.internal.*
 import kotlinx.coroutines.internal.SegmentQueueSynchronizer.ResumeMode.*
+import kotlinx.coroutines.internal.SegmentQueueSynchronizer.SkipCancelledCells.*
 import kotlinx.coroutines.sync.*
 import org.jetbrains.kotlinx.lincheck.annotations.Operation
 import org.jetbrains.kotlinx.lincheck.verifier.*
@@ -66,7 +67,7 @@ internal class AsyncSemaphore(permits: Int) : AsyncSemaphoreBase(permits) {
 }
 
 internal class AsyncSemaphoreSmart(permits: Int) : AsyncSemaphoreBase(permits) {
-    override val skipCancelled: Boolean get() = true
+    override val onCancelledCell get() = SKIP_SYNC
 
     override fun release() {
         val p = incPermits()
@@ -81,8 +82,8 @@ internal class AsyncSemaphoreSmart(permits: Int) : AsyncSemaphoreBase(permits) {
 }
 
 internal class SyncSemaphoreSmart(permits: Int) : SegmentQueueSynchronizer<Boolean>(), Semaphore {
-    override val resumeMode: ResumeMode get() = SYNC
-    override val skipCancelled: Boolean get() = true
+    override val resumeMode get() = SYNC
+    override val onCancelledCell get() = SKIP_SYNC
 
     private val _availablePermits = atomic(permits)
     override val availablePermits get() = error("Not implemented")
@@ -160,7 +161,7 @@ class SyncSemaphoreSmart2LCStressTest : SemaphoreLCStressTestBase(SyncSemaphoreS
 // ####################################
 
 internal open class CountDownLatch(count: Int) : SegmentQueueSynchronizer<Unit>() {
-    override val resumeMode: ResumeMode get() = ASYNC
+    override val resumeMode get() = ASYNC
 
     private val count = atomic(count)
     private val waiters = atomic(0)
@@ -198,7 +199,7 @@ internal open class CountDownLatch(count: Int) : SegmentQueueSynchronizer<Unit>(
 }
 
 internal class CountDownLatchSmart(count: Int) : CountDownLatch(count) {
-    override val skipCancelled: Boolean get() = true
+    override val onCancelledCell get() = SKIP_ASYNC
 
     override fun onCancellation(): Boolean {
         val w = decWaiters()
@@ -262,8 +263,8 @@ open class CountDownLatchSequential(initialCount: Int) : VerifierState() {
 // ###########################
 
 internal class Barrier(private val parties: Int) : SegmentQueueSynchronizer<Unit>() {
-    override val resumeMode: ResumeMode get() = ASYNC
-    override val skipCancelled: Boolean get() = true
+    override val resumeMode get() = ASYNC
+    override val onCancelledCell get() = SKIP_ASYNC
 
     private val arrived = atomic(0L)
 
@@ -384,7 +385,7 @@ interface BlockingPool<T: Any> {
 } // TODO: smart cancellation is possible!
 
 internal class BlockingQueuePool<T: Any> : SegmentQueueSynchronizer<T>(), BlockingPool<T> {
-    override val resumeMode: ResumeMode get() = ASYNC
+    override val resumeMode get() = ASYNC
 
     private val balance = atomic(0L) // #put  - #retrieve
 
@@ -461,40 +462,57 @@ internal class BlockingQueuePool<T: Any> : SegmentQueueSynchronizer<T>(), Blocki
 }
 
 internal class BlockingStackPool<T: Any> : SegmentQueueSynchronizer<T>(), BlockingPool<T> {
-    override val resumeMode: ResumeMode get() = ASYNC
-    override val skipCancelled: Boolean get() = true
+    override val resumeMode get() = ASYNC
+    override val onCancelledCell get() = SKIP_SYNC
 
     private val head = atomic<StackNode<T>?>(null)
     private val availableElements = atomic(0) // #put - #retrieve
 
     override fun put(element: T) { // == release
-        val b = availableElements.getAndIncrement()
-        if (b >= 0) {
-            tryInsert(element)
-            return
+        while (true) {
+            val b = availableElements.getAndIncrement()
+            if (b >= 0) {
+                if (tryInsert(element)) return
+            } else {
+                resume(element)
+                return
+            }
         }
-        resume(element)
     }
 
-    private fun tryInsert(element: T) {
+    private fun tryInsert(element: T): Boolean {
         head.loop { h ->
-            val newHead = StackNode(element, h)
-            if (head.compareAndSet(h, newHead)) return
+            if (h != null && h.element == null) {
+                if (head.compareAndSet(h, h.next)) return false
+            } else {
+                val newHead = StackNode(element, h)
+                if (head.compareAndSet(h, newHead)) return true
+            }
         }
     }
 
     override suspend fun retrieve(): T { // == acquire
-        val b = availableElements.getAndDecrement()
-        if (b > 0) return tryRetrieve()
-        return suspendAtomicCancellableCoroutine { cont ->
-            suspend(cont)
+        while (true) {
+            val b = availableElements.getAndDecrement()
+            if (b > 0) {
+                val x = tryRetrieve()
+                if (x != null) return x
+            } else {
+                return suspendAtomicCancellableCoroutine { cont ->
+                    suspend(cont)
+                }
+            }
         }
     }
 
-    private fun tryRetrieve(): T {
+    private fun tryRetrieve(): T? {
         head.loop { h ->
-            if (h != null && head.compareAndSet(h, h.next))
-                return h.element
+            if (h == null || h.element == null) {
+                val failNode = StackNode(null, h)
+                if (head.compareAndSet(h, failNode)) return null
+            } else {
+                if (head.compareAndSet(h, h.next)) return h.element
+            }
         }
     }
 
@@ -505,10 +523,11 @@ internal class BlockingStackPool<T: Any> : SegmentQueueSynchronizer<T>(), Blocki
     }
 
     override fun onIgnoredValue(value: T) {
-        tryInsert(value)
+        if (tryInsert(value)) return
+        put(value)
     }
 
-    class StackNode<T>(val element: T, val next: StackNode<T>?)
+    class StackNode<T>(val element: T?, val next: StackNode<T>?)
 }
 
 abstract class BlockingPoolLCStressTestBase(val p: BlockingPool<Unit>) {

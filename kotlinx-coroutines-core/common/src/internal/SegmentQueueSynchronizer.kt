@@ -6,7 +6,9 @@ package kotlinx.coroutines.internal
 
 import kotlinx.atomicfu.*
 import kotlinx.coroutines.*
-import kotlinx.coroutines.internal.SegmentQueueSynchronizer.ResumeMode.*
+import kotlinx.coroutines.internal.SegmentQueueSynchronizer.ResumeMode.ASYNC
+import kotlinx.coroutines.internal.SegmentQueueSynchronizer.ResumeMode.SYNC
+import kotlinx.coroutines.internal.SegmentQueueSynchronizer.SkipCancelledCells.*
 import kotlinx.coroutines.sync.*
 import kotlin.coroutines.*
 import kotlin.native.concurrent.*
@@ -97,7 +99,7 @@ internal abstract class SegmentQueueSynchronizer<T> {
      * or fail in this case (`false`). By default, [resume] fails if
      * comes to a cancelled waiter.
      */
-    protected open val skipCancelled: Boolean get() = false
+    protected open val onCancelledCell: SkipCancelledCells get() = FAIL
 
     /**
      * TODO
@@ -134,6 +136,7 @@ internal abstract class SegmentQueueSynchronizer<T> {
      * [suspended][suspend] continuations has been cancelled.
      */
     fun resume(value: T): Boolean {
+        val skipCancelled = onCancelledCell != FAIL
         while (true) {
             when (tryResumeImpl(value, adjustDeqIdx = skipCancelled)) {
                 TRY_RESUME_SUCCESS -> return true
@@ -184,10 +187,15 @@ internal abstract class SegmentQueueSynchronizer<T> {
                         segment.set(i, DONE)
                         return TRY_RESUME_SUCCESS
                     } else {
-                        if (!skipCancelled) return TRY_RESUME_FAIL_CANCELLED
-                        // Let the cancellation handler decide what to do with the element :)
-                        val valueToStore: Any? = if (value is Continuation<*>) WrappedContinuation(value) else value
-                        if (segment.cas(i, cellState, valueToStore)) return TRY_RESUME_SUCCESS
+                        when (onCancelledCell) {
+                            FAIL -> return TRY_RESUME_FAIL_CANCELLED
+                            SKIP_SYNC -> continue@modify_cell
+                            SKIP_ASYNC -> {
+                                // Let the cancellation handler decide what to do with the element :)
+                                val valueToStore: Any? = if (value is Continuation<*>) WrappedContinuation(value) else value
+                                if (segment.cas(i, cellState, valueToStore)) return TRY_RESUME_SUCCESS
+                            }
+                        }
                     }
                 }
                 else -> {
@@ -228,6 +236,8 @@ internal abstract class SegmentQueueSynchronizer<T> {
      * [suspend] invocation finds the cell [broken][BROKEN] and fails as well.
      */
     internal enum class ResumeMode { SYNC, ASYNC }
+
+    internal enum class SkipCancelledCells { FAIL, SKIP_SYNC, SKIP_ASYNC }
 
     private inner class SQSCancellationHandler(
         private val segment: SQSSegment,
