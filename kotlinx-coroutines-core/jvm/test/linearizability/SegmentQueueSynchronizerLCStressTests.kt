@@ -9,7 +9,7 @@ import kotlinx.atomicfu.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.internal.*
 import kotlinx.coroutines.internal.SegmentQueueSynchronizer.ResumeMode.*
-import kotlinx.coroutines.internal.SegmentQueueSynchronizer.SkipCancelledCells.*
+import kotlinx.coroutines.internal.SegmentQueueSynchronizer.CancellationMode.*
 import kotlinx.coroutines.sync.*
 import org.jetbrains.kotlinx.lincheck.annotations.Operation
 import org.jetbrains.kotlinx.lincheck.verifier.*
@@ -67,7 +67,7 @@ internal class AsyncSemaphore(permits: Int) : AsyncSemaphoreBase(permits) {
 }
 
 internal class AsyncSemaphoreSmart(permits: Int) : AsyncSemaphoreBase(permits) {
-    override val onCancelledCell get() = SKIP_SYNC
+    override val cancellationMode get() = SMART_SYNC
 
     override fun release() {
         val p = incPermits()
@@ -83,7 +83,7 @@ internal class AsyncSemaphoreSmart(permits: Int) : AsyncSemaphoreBase(permits) {
 
 internal class SyncSemaphoreSmart(permits: Int) : SegmentQueueSynchronizer<Boolean>(), Semaphore {
     override val resumeMode get() = SYNC
-    override val onCancelledCell get() = SKIP_SYNC
+    override val cancellationMode get() = SMART_SYNC
 
     private val _availablePermits = atomic(permits)
     override val availablePermits get() = error("Not implemented")
@@ -199,7 +199,7 @@ internal open class CountDownLatch(count: Int) : SegmentQueueSynchronizer<Unit>(
 }
 
 internal class CountDownLatchSmart(count: Int) : CountDownLatch(count) {
-    override val onCancelledCell get() = SKIP_ASYNC
+    override val cancellationMode get() = SMART_ASYNC
 
     override fun onCancellation(): Boolean {
         val w = decWaiters()
@@ -264,7 +264,7 @@ open class CountDownLatchSequential(initialCount: Int) : VerifierState() {
 
 internal class Barrier(private val parties: Int) : SegmentQueueSynchronizer<Unit>() {
     override val resumeMode get() = ASYNC
-    override val onCancelledCell get() = SKIP_ASYNC
+    override val cancellationMode get() = SMART_ASYNC
 
     private val arrived = atomic(0L)
 
@@ -463,7 +463,7 @@ internal class BlockingQueuePool<T: Any> : SegmentQueueSynchronizer<T>(), Blocki
 
 internal class BlockingStackPool<T: Any> : SegmentQueueSynchronizer<T>(), BlockingPool<T> {
     override val resumeMode get() = ASYNC
-    override val onCancelledCell get() = SKIP_SYNC
+    override val cancellationMode get() = SMART_SYNC
 
     private val head = atomic<StackNode<T>?>(null)
     private val availableElements = atomic(0) // #put - #retrieve

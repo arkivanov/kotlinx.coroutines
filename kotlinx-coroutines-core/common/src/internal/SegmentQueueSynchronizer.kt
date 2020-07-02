@@ -8,7 +8,7 @@ import kotlinx.atomicfu.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.internal.SegmentQueueSynchronizer.ResumeMode.ASYNC
 import kotlinx.coroutines.internal.SegmentQueueSynchronizer.ResumeMode.SYNC
-import kotlinx.coroutines.internal.SegmentQueueSynchronizer.SkipCancelledCells.*
+import kotlinx.coroutines.internal.SegmentQueueSynchronizer.CancellationMode.*
 import kotlinx.coroutines.sync.*
 import kotlin.coroutines.*
 import kotlin.native.concurrent.*
@@ -95,11 +95,29 @@ internal abstract class SegmentQueueSynchronizer<T> {
     protected open val resumeMode: ResumeMode get() = SYNC
 
     /**
+     * Specifies whether [resume] should fail on cancelled waiters ([SIMPLE]),
+     * or skip them in either [synchronous][SMART_SYNC] or [asynchronous][SMART_ASYNC]
+     * way; in the asynchronous skip mode [resume] may pass the element to the
+     * cancellation handler in order not to wait, so that the element can be "hung" for a while.
      * Specifies whether [resume] should skip cancelled waiters (`true`)
      * or fail in this case (`false`). By default, [resume] fails if
      * comes to a cancelled waiter.
      */
-    protected open val onCancelledCell: SkipCancelledCells get() = FAIL
+    protected open val cancellationMode: CancellationMode get() = SIMPLE
+
+    /**
+     * This function is invoked when waiter is cancelled. It returns
+     * `true` if the cancellation succeeds and no additional synchronization
+     * is required, so that the corresponding cell can be marked as [CANCELLED].
+     * However, if a concurrent [resume] is already going to resume this waiter,
+     * [onCancellation] returns `false` so that the element
+     * and `false` if the element should be resumed blah-
+     */
+    open fun onCancellation() : Boolean = false
+
+    open fun onIgnoredValue(value: T) {}
+
+    open fun onResumeFailure(value: T) {}
 
     /**
      * TODO
@@ -136,7 +154,7 @@ internal abstract class SegmentQueueSynchronizer<T> {
      * [suspended][suspend] continuations has been cancelled.
      */
     fun resume(value: T): Boolean {
-        val skipCancelled = onCancelledCell != FAIL
+        val skipCancelled = cancellationMode != SIMPLE
         while (true) {
             when (tryResumeImpl(value, adjustDeqIdx = skipCancelled)) {
                 TRY_RESUME_SUCCESS -> return true
@@ -187,10 +205,10 @@ internal abstract class SegmentQueueSynchronizer<T> {
                         segment.set(i, DONE)
                         return TRY_RESUME_SUCCESS
                     } else {
-                        when (onCancelledCell) {
-                            FAIL -> return TRY_RESUME_FAIL_CANCELLED
-                            SKIP_SYNC -> continue@modify_cell
-                            SKIP_ASYNC -> {
+                        when (cancellationMode) {
+                            SIMPLE -> return TRY_RESUME_FAIL_CANCELLED
+                            SMART_SYNC -> continue@modify_cell
+                            SMART_ASYNC -> {
                                 // Let the cancellation handler decide what to do with the element :)
                                 val valueToStore: Any? = if (value is Continuation<*>) WrappedContinuation(value) else value
                                 if (segment.cas(i, cellState, valueToStore)) return TRY_RESUME_SUCCESS
@@ -213,15 +231,6 @@ internal abstract class SegmentQueueSynchronizer<T> {
     }
 
     /**
-     * TODO
-     */
-    open fun onCancellation() : Boolean = false
-
-    open fun onIgnoredValue(value: T) {}
-
-    open fun onResumeFailure(value: T) {}
-
-    /**
      * These modes define the strategy that [tryResume] and [resume] should
      * use when they come to the cell before [suspend] and find it empty.
      * In the [asynchronous][ASYNC] mode, they put the value into the slot,
@@ -237,21 +246,21 @@ internal abstract class SegmentQueueSynchronizer<T> {
      */
     internal enum class ResumeMode { SYNC, ASYNC }
 
-    internal enum class SkipCancelledCells { FAIL, SKIP_SYNC, SKIP_ASYNC }
+    internal enum class CancellationMode { SIMPLE, SMART_SYNC, SMART_ASYNC }
 
     private inner class SQSCancellationHandler(
         private val segment: SQSSegment,
         private val index: Int
     ) : CancelHandler() {
         override fun invoke(cause: Throwable?) {
-            val ignore = onCancellation()
-            if (ignore) {
-                val value = segment.markIgnored(index) ?: return
-                onIgnoredValue(value as T)
-            } else {
+            val cancelled = onCancellation()
+            if (cancelled) {
                 val value = segment.markCancelled(index) ?: return
                 if (resume(value as T)) return
                 onResumeFailure(value)
+            } else {
+                val value = segment.markIgnored(index) ?: return
+                onIgnoredValue(value as T)
             }
         }
 
