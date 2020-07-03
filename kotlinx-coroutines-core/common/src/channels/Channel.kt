@@ -576,8 +576,8 @@ public interface Channel<E> : SendChannel<E>, ReceiveChannel<E> {
  *
  * @param capacity either a positive channel capacity or one of the constants defined in [Channel.Factory].
  * @param onBufferOverflow configures an action on buffer overflow (optional, defaults to
- *   [suspending][BufferOverflow.SUSPEND] attempt to [send][Channel.send] a value,
- *   supported only when `capacity >= 0` or `capacity = Channel.BUFFERED`,
+ *   a [suspending][BufferOverflow.SUSPEND] attempt to [send][Channel.send] a value,
+ *   supported only when `capacity >= 0` or `capacity == Channel.BUFFERED`,
  *   implicitly creates a channel with at least one buffered element).
  * @throws IllegalArgumentException when [capacity] < -2
  */
