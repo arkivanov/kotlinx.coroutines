@@ -511,7 +511,7 @@ public interface ChannelIterator<out E> {
  *   This channel has an array buffer of a fixed `capacity`.
  *   [Sending][send] suspends only when the buffer is full, and [receiving][receive] suspends only when the buffer is empty.
  *
- * Buffered channels can be configured with an additional [`onBufferOverflow`][BufferOverflow] parameter. It controls behaviour
+ * Buffered channels can be configured with an additional [`onBufferOverflow`][BufferOverflow] parameter. It controls the behaviour
  * of the channel's [send][Channel.send] function on buffer overflow:
  *
  * * [SUSPEND][BufferOverflow.SUSPEND] &mdash; the default, suspend `send` on buffer overflow until there is
