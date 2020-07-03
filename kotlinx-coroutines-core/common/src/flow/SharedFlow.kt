@@ -59,10 +59,10 @@ import kotlin.native.concurrent.*
  * specified when the shared flow is created by the `replay` parameter. A snapshot of the current replay cache
  * is available via the [replayCache] property and it can be reset with the [MutableSharedFlow.resetReplayCache] function.
  *
- * A replay cache provides buffer for emissions to the shared flow. Buffer space allows slow subscribers to
+ * A replay cache also provides buffer for emissions to the shared flow, allowing slow subscribers to
  * get values from the buffer without suspending emitters. The buffer space determines how much slow subscribers
- * can lag from the fast ones. When creating a shared flow additional buffer capacity beyond replay can be reserved
- * using `extraBufferCapacity` parameter.
+ * can lag from the fast ones. When creating a shared flow, additional buffer capacity beyond replay can be reserved
+ * using the `extraBufferCapacity` parameter.
  * 
  * A shared flow with a buffer can be configured to avoid suspension of emitters on buffer overflow using
  * `onBufferOverflow` parameter, which is equal to one of the entries of [BufferOverflow] enum. When a strategy other
