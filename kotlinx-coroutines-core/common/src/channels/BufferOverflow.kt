@@ -10,7 +10,7 @@ import kotlinx.coroutines.*
  * A strategy for buffer overflow handling in [channels][Channel] and [flows][kotlinx.coroutines.flow.Flow] that
  * controls what is going to be sacrificed on buffer overflow:
  *
- * * [SUSPEND] &mdash; upstream that is [sending][SendChannel.send] or
+ * * [SUSPEND] &mdash; the upstream that is [sending][SendChannel.send] or
  *   is [emitting][kotlinx.coroutines.flow.FlowCollector.emit] a value is **suspended** while the buffer is full.
  * * [DROP_OLDEST] &mdash; drop **the oldest** value in the buffer on overflow, add the new value to the buffer, do not suspend.
  * * [DROP_LATEST] &mdash; drop **the latest** value that is being added to the buffer right now on buffer overflow,
