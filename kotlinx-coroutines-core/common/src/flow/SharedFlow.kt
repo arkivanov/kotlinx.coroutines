@@ -54,10 +54,10 @@ import kotlin.native.concurrent.*
  *
  * ### Replay cache and buffer
  *
- * A shared flow keeps a specific number of the most recent values in its _replay cache_. Every new subscribers first
- * gets the values from the replay cache and then gets new emitted values. The maximal size of the replay cache is
+ * A shared flow keeps a specific number of the most recent values in its _replay cache_. Every new subscriber first
+ * gets the values from the replay cache and then gets new emitted values. The maximum size of the replay cache is
  * specified when the shared flow is created by the `replay` parameter. A snapshot of the current replay cache
- * is available via [replayCache] property and it can be reset with [MutableSharedFlow.resetReplayCache] function.
+ * is available via the [replayCache] property and it can be reset with the [MutableSharedFlow.resetReplayCache] function.
  *
  * A replay cache provides buffer for emissions to the shared flow. Buffer space allows slow subscribers to
  * get values from the buffer without suspending emitters. The buffer space determines how much slow subscribers
