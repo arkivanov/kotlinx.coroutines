@@ -35,7 +35,7 @@ import kotlin.coroutines.intrinsics.*
  * [send][BroadcastChannel.send] and [close][BroadcastChannel.close] operations that interfere with
  * the broadcasting coroutine in hard-to-specify ways.
  *
- * **Note: This API is obsolete.** It will be deprecated and replaced with
+ * **Note: This API is obsolete.** It will be deprecated and replaced with the
  * [Flow.shareIn][kotlinx.coroutines.flow.shareIn] operator when it becomes stable.
  *
  * @param start coroutine start option. The default value is [CoroutineStart.LAZY].
