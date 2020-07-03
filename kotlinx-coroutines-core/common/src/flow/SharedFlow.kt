@@ -27,9 +27,9 @@ import kotlin.native.concurrent.*
  * when applied to a shared flow, but flow-truncating operators like [Flow.take] and [Flow.takeWhile] can be used on a
  * shared flow to turn it into a completing one.
  *
- * A [mutable shared flow][MutableSharedFlow] is created using [MutableSharedFlow(...)] constructor function.
+ * A [mutable shared flow][MutableSharedFlow] is created using the [MutableSharedFlow(...)] constructor function.
  * Its state can be updated by [emitting][MutableSharedFlow.emit] values to it and performing other operations.
- * See [MutableSharedFlow] documentation for details.
+ * See the [MutableSharedFlow] documentation for details.
  *
  * [SharedFlow] is useful to broadcast events that happens inside application to subscribers that can come and go.
  * For example, the following class encapsulates an event bus that distributes events to all subscribers
