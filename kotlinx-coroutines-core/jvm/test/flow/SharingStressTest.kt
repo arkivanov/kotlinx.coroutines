@@ -114,7 +114,7 @@ class SharingStressTest : TestBase() {
                             delay(random.nextLong(50L..100L))
                         } while (emitIndex.get() < waitEmitIndex)  // Ok, enough was emitted, wait more if not
                     }
-                    // Stop all subscribers and ensure check collected something
+                    // Stop all subscribers and ensure they collected something
                     log("Stopping subscribers (emitted = ${emitIndex.get() - fromEmitIndex})")
                     subscribers.forEach {
                         it.job.cancelAndJoin()
