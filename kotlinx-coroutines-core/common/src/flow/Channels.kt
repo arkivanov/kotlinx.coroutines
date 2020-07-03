@@ -187,7 +187,7 @@ public fun <T> BroadcastChannel<T>.asFlow(): Flow<T> = flow {
  * that is to control backpressure behavior.
  *
  * **Note: This API is obsolete.** It will be deprecated and replaced with
- * [Flow.shareIn] operator when it becomes stable.
+ * the [Flow.shareIn] operator when it becomes stable.
  */
 @FlowPreview
 public fun <T> Flow<T>.broadcastIn(
