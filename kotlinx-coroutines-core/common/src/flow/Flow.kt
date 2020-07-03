@@ -42,8 +42,8 @@ import kotlin.coroutines.*
  * triggers execution of the same code every time it is collected, or if it is a _hot_ stream that emits different
  * values from the same running source on each collection. Usually flows represent _cold_ streams, but
  * there is a [SharedFlow] subtype that represents _hot_ streams. In addition to that, any flow can be turned
- * into a _hot_ one by [stateIn] and [shareIn] operators or by converting the flow into a hot channel
- * via [produceIn] operator.
+ * into a _hot_ one by the [stateIn] and [shareIn] operators, or by converting the flow into a hot channel
+ * via the [produceIn] operator.
  *
  * ### Flow builders
  *
