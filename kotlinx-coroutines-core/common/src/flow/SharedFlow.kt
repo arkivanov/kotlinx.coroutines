@@ -46,8 +46,8 @@ import kotlin.native.concurrent.*
  * }
  * ```
  *
- * As an alternative to the above usage with `MutableSharedFlow(...)` constructor function,
- * any _cold_ [Flow] can be converted to a shared flow using [shareIn] operator.
+ * As an alternative to the above usage with the `MutableSharedFlow(...)` constructor function,
+ * any _cold_ [Flow] can be converted to a shared flow using the [shareIn] operator.
  *
  * There is a specialized implementation of shared flow for a case where the most recent state value needs
  * to be shared. See [StateFlow] for details.
