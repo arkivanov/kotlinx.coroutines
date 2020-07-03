@@ -118,7 +118,7 @@ class SharingStressTest : TestBase() {
                     log("Stopping subscribers (emitted = ${emitIndex.get() - fromEmitIndex})")
                     subscribers.forEach {
                         it.job.cancelAndJoin()
-                        assertTrue { it.count > 0 } // something must be collected, too
+                        assertTrue { it.count > 0 } // something must be collected too
                     }
                     subscribers.clear()
                     log("Intermission")
