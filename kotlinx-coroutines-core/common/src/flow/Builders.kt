@@ -71,7 +71,7 @@ public fun <T> (() -> T).asFlow(): Flow<T> = flow {
 }
 
 /**
- * Creates a _cold flow that produces a single value from the given functional type.
+ * Creates a _cold_ flow that produces a single value from the given functional type.
  *
  * Example of usage:
  *
