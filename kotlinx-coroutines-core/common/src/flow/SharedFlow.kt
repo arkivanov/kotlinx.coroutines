@@ -31,9 +31,9 @@ import kotlin.native.concurrent.*
  * Its state can be updated by [emitting][MutableSharedFlow.emit] values to it and performing other operations.
  * See the [MutableSharedFlow] documentation for details.
  *
- * [SharedFlow] is useful to broadcast events that happens inside application to subscribers that can come and go.
+ * [SharedFlow] is useful for broadcasting events that happen inside an application to subscribers that can come and go.
  * For example, the following class encapsulates an event bus that distributes events to all subscribers
- * in _rendezvous_ manner, suspending until all subscribers process each event:
+ * in a _rendezvous_ manner, suspending until all subscribers process each event:
  *
  * ```
  * class EventBus {
