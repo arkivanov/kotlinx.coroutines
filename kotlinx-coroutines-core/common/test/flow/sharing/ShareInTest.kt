@@ -42,7 +42,7 @@ class ShareInTest : TestBase() {
         val sharingJob = Job()
         val shared = flow.shareIn(this + sharingJob, replay, started = SharingStarted.Lazily)
         yield() // should not start sharing
-        // first subscriber gets Ok, other subscribers miss "OK"
+        // first subscriber gets "OK", other subscribers miss "OK"
         val n = 10
         val replayOfs = replay * (n - 1)
         val subscriberJobs = List(n) { index ->
