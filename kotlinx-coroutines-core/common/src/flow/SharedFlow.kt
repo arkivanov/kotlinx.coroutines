@@ -18,8 +18,8 @@ import kotlin.native.concurrent.*
  * presence of collectors. This is opposed to a regular [Flow], such as defined by the [`flow { ... }`][flow] function,
  * which is _cold_ and is started separately for each collector.
  *
- * **Shared flow never completes**. A call to [Flow.collect] on a shared flow never completes normally and
- * so does a coroutine started by [Flow.launchIn] function. An active collector of a shared flow is called a _subscriber_.
+ * **Shared flow never completes**. A call to [Flow.collect] on a shared flow never completes normally, and
+ * neither does a coroutine started by the [Flow.launchIn] function. An active collector of a shared flow is called a _subscriber_.
  *
  * A subscriber of a shared flow can be cancelled, which usually happens when the scope the coroutine is running
  * in is cancelled. A subscriber to a shared flow in always [cancellable][Flow.cancellable] and checks for
